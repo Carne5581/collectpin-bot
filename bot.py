@@ -2,25 +2,26 @@ import os
 import json
 import requests
 import feedparser
+import time
 from google import genai
 
 # Забираем секретные ключи
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-# Настраиваем ИИ (Новая библиотека 2026 года)
+# Настраиваем ИИ 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 def fetch_reddit_posts():
-    """Читает RSS-ленту Reddit, чтобы обойти блокировку IP-адресов GitHub"""
+    """Читает RSS-ленту Reddit с паузами, чтобы не получить бан 429"""
     urls = [
         "https://www.reddit.com/r/GTA6/new.rss",
         "https://www.reddit.com/r/GTA6_Mapping/new.rss"
     ]
     
-    # Притворяемся обычным браузером Windows
+    # Reddit просит ботов представляться именно так
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'CollectPin-ScannerBot/1.0'
     }
     
     posts = []
@@ -29,18 +30,20 @@ def fetch_reddit_posts():
         try:
             response = requests.get(url, headers=headers)
             if response.status_code == 200:
-                # Парсим XML/RSS
                 feed = feedparser.parse(response.content)
-                for entry in feed.entries[:15]: # Берем 15 самых свежих
+                for entry in feed.entries[:10]: # Берем 10 самых свежих
                     posts.append({
                         "title": entry.title,
-                        "text": entry.summary,
+                        "text": getattr(entry, 'summary', ''),
                         "link": entry.link
                     })
             else:
                 print(f"Reddit вернул ошибку: {response.status_code} для {url}")
         except Exception as e:
             print(f"Ошибка парсинга RSS: {e}")
+            
+        # ПАУЗА 3 секунды, чтобы Reddit нас не забанил
+        time.sleep(3) 
             
     return posts
 
@@ -83,7 +86,7 @@ def analyze_with_ai(post):
         data['source_url'] = post['link']
         return data
     except Exception as e:
-        print(f"Ошибка ИИ или парсинга JSON: {e}")
+        print(f"Ошибка ИИ: {e}")
         return None
 
 def send_to_google_sheets(ai_results):
@@ -101,7 +104,7 @@ def main():
     posts = fetch_reddit_posts()
     print(f"Собрано постов для проверки: {len(posts)}")
     
-    # Ключевые слова для первичной фильтрации
+    # Ключевые слова для первичной фильтрации (чтобы не гонять ИИ впустую)
     keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'нашел', 'тайник', 'секрет', 'here']
     
     ai_results = []
@@ -110,10 +113,14 @@ def main():
         content = (post['title'] + " " + post['text']).lower()
         if any(word in content for word in keywords):
             print(f"Анализируем пост: {post['title']}")
+            
             result = analyze_with_ai(post)
             if result:
                 print(f"ИИ нашел точку: {result['name']}")
                 ai_results.append(result)
+                
+            # ПАУЗА 4 секунды, чтобы Гугл не выдал ошибку 429 (Слишком много запросов)
+            time.sleep(4)
             
     if ai_results:
         send_to_google_sheets(ai_results)
