@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import requests
 import feedparser
 import time
@@ -7,118 +8,130 @@ from groq import Groq
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+LOG_FILE = "seen_posts.json"
 
 client = Groq(api_key=GROQ_API_KEY)
 
-def fetch_reddit_posts():
-    """Читает объединенную RSS-ленту за один запрос (нет ошибки 429)"""
-    # Знак + объединяет сабреддиты в одну ленту!
-    url = "https://www.reddit.com/r/GTA6+GTA6_Mapping/new.rss"
-    
-    headers = {
-        'User-Agent': 'CollectPin-ScannerBot/2.0'
-    }
+def load_seen_posts():
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_seen_posts(seen_list):
+    # Храним только последние 500 ID, чтобы файл не пух
+    with open(LOG_FILE, 'w') as f:
+        json.dump(seen_list[-500:], f)
+
+def extract_image_from_html(html_content):
+    """Вытаскивает ссылку на картинку из поста Reddit"""
+    match = re.search(r'<img[^>]+src="([^">]+)"', html_content)
+    return match.group(1) if match else ""
+
+def fetch_reddit_posts(seen_posts):
+    url = "https://www.reddit.com/r/GTA6+GTA6_Mapping/new.rss?limit=100"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/3.0'}
     
     posts = []
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             feed = feedparser.parse(response.content)
-            for entry in feed.entries[:15]: # Берем 15 самых свежих со всех сабреддитов
+            for entry in feed.entries:
+                post_id = entry.id
+                if post_id in seen_posts:
+                    continue # Пропускаем то, что уже видели
+                
                 posts.append({
+                    "id": post_id,
                     "title": entry.title,
                     "text": getattr(entry, 'summary', ''),
+                    "image_url": extract_image_from_html(getattr(entry, 'summary', '')),
                     "link": entry.link
                 })
-        else:
-            print(f"Reddit вернул ошибку: {response.status_code}")
     except Exception as e:
-        print(f"Ошибка парсинга RSS: {e}")
+        print(f"Ошибка RSS: {e}")
             
     return posts
 
 def analyze_with_ai(post):
-    """Жесткий промпт для ИИ, чтобы не пропускал мусор"""
     prompt = f"""
-    Ты — строгий модератор базы данных для интерактивной карты GTA 6. 
-    Прочитай этот пост. Твоя задача — найти ТОЛЬКО реальные находки в игре (коллекционные предметы, секреты, редкий транспорт, тайники).
+    Ты — строгий аналитик данных для интерактивной карты GTA 6. 
+    Прочитай этот пост с Reddit. Ищи ТОЛЬКО реальные находки (коллекционки, секреты, транспорт, пасхалки).
     
     Заголовок: {post['title']}
     Текст: {post['text']}
     
     ПРАВИЛА:
-    1. Если это слух, теория, новость, обсуждение трейлера, мем или мнение (например, "Тревор появится в игре" или "Скидки на PS5") — ТЫ ОБЯЗАН ОТВЕТИТЬ ТОЛЬКО СЛОВОМ FALSE.
-    2. Не выдавай JSON, если это не конкретная находка на карте!
-    3. Если это РЕАЛЬНАЯ находка, ответь СТРОГО в формате JSON:
+    1. Если это слух, мем, вопрос, обсуждение трейлера — ответь ТОЛЬКО словом FALSE.
+    2. Если это РЕАЛЬНАЯ находка, найди координаты (обычно в формате X, Y или [X,Y]).
+    3. Ответь СТРОГО в формате JSON без лишних слов:
     {{
-        "category": "тайник, транспорт, секрет или коллекционка",
+        "category": "тайник / транспорт / секрет / коллекционка",
         "name": "Название предмета",
-        "hint": "Как найти (ориентиры)",
-        "region": "Регион"
+        "region": "Регион (если указан, иначе Unknown)",
+        "coord_x": "Координата X (если есть, иначе пусто)",
+        "coord_y": "Координата Y (если есть, иначе пусто)"
     }}
     """
     
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant", 
-            temperature=0.0, # 0.0 делает ИИ максимально строгим и логичным
+            model="llama3-70b-8192", # Используем более умную модель
+            temperature=0.0,
         )
         
         result_text = chat_completion.choices[0].message.content.strip()
         
-        if result_text.startswith("```json"):
-            result_text = result_text[7:-3]
-        elif result_text.startswith("```"):
-            result_text = result_text[3:-3]
-            
-        if "FALSE" in result_text.upper() or not result_text.startswith("{"):
+        if "FALSE" in result_text.upper() and "{" not in result_text:
             return None
             
-        data = json.loads(result_text)
+        # Надежный парсинг JSON через Regex
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if not json_match:
+            return None
+            
+        data = json.loads(json_match.group(0))
         data['source_url'] = post['link']
+        data['image_url'] = post['image_url']
         return data
     except Exception as e:
         print(f"Ошибка ИИ: {e}")
         return None
 
-def send_to_google_sheets(ai_results):
-    if not ai_results:
-        return
-    try:
-        requests.post(WEBHOOK_URL, json=ai_results)
-        print(f"Отправлено в таблицу.")
-    except Exception as e:
-        print(f"Ошибка отправки в таблицу: {e}")
-
 def main():
-    print("Начинаем сканирование...")
-    posts = fetch_reddit_posts()
-    print(f"Собрано постов для проверки: {len(posts)}")
+    seen_posts = load_seen_posts()
+    posts = fetch_reddit_posts(seen_posts)
+    print(f"Новых постов для проверки: {len(posts)}")
     
-    keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'нашел', 'тайник', 'секрет', 'here']
-    
+    keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'coordinate', 'x:', 'y:']
     ai_results = []
+    new_seen_ids = []
     
     for post in posts:
+        new_seen_ids.append(post['id'])
         content = (post['title'] + " " + post['text']).lower()
+        
         if any(word in content for word in keywords):
-            print(f"Анализируем пост: {post['title']}")
-            
+            print(f"Анализируем: {post['title']}")
             result = analyze_with_ai(post)
+            
             if result:
-                print(f"ИИ подтвердил точку: {result['name']}")
+                print(f"✅ Найдено: {result['name']}")
                 ai_results.append(result)
-            else:
-                print("ИИ отбраковал пост (мусор/слух).")
-                
-            time.sleep(2) 
+            time.sleep(1) # Пауза для лимитов API
             
     if ai_results:
-        send_to_google_sheets(ai_results)
-        print(f"Успешно отправлено {len(ai_results)} точек.")
-    else:
-        print("Новых точек не найдено.")
+        try:
+            requests.post(WEBHOOK_URL, json=ai_results)
+            print(f"Отправлено {len(ai_results)} точек в таблицу.")
+        except Exception as e:
+            print(f"Ошибка вебхука: {e}")
+            
+    # Сохраняем логи, чтобы не проверять эти посты снова
+    seen_posts.extend(new_seen_ids)
+    save_seen_posts(seen_posts)
 
 if __name__ == "__main__":
     main()
