@@ -2,8 +2,11 @@ name: Run CollectPin Scanner
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '*/15 * * * *' # Запуск каждые 15 минут!
   workflow_dispatch:
+
+permissions:
+  contents: write # Разрешаем боту сохранять лог-файл
 
 jobs:
   run-bot:
@@ -25,3 +28,11 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: python bot.py
+        
+      - name: Save seen posts log
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add seen_posts.json
+          # Коммитим только если файл изменился
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update seen posts log" && git push)
