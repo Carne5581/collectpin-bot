@@ -1,37 +1,47 @@
 import os
 import json
 import requests
-import google.generativeai as genai
-import time
+import feedparser
+from google import genai
 
-# Забираем секретные ключи из настроек GitHub
+# Забираем секретные ключи
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-# Настраиваем ИИ
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash') # Быстрая и бесплатная модель
+# Настраиваем ИИ (Новая библиотека 2026 года)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 def fetch_reddit_posts():
-    """Собирает свежие посты с Reddit без API-ключей, просто по JSON"""
+    """Читает RSS-ленту Reddit, чтобы обойти блокировку IP-адресов GitHub"""
     urls = [
-        "https://www.reddit.com/r/GTA6/new.json?limit=20",
-        "https://www.reddit.com/r/GTA6_Mapping/new.json?limit=10"
+        "https://www.reddit.com/r/GTA6/new.rss",
+        "https://www.reddit.com/r/GTA6_Mapping/new.rss"
     ]
-    headers = {'User-Agent': 'CollectPin-Scanner/1.0'}
+    
+    # Притворяемся обычным браузером Windows
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
     posts = []
     
     for url in urls:
         try:
             response = requests.get(url, headers=headers)
-            data = response.json()
-            for child in data['data']['children']:
-                title = child['data'].get('title', '')
-                text = child['data'].get('selftext', '')
-                link = "https://www.reddit.com" + child['data'].get('permalink', '')
-                posts.append({"title": title, "text": text, "link": link})
+            if response.status_code == 200:
+                # Парсим XML/RSS
+                feed = feedparser.parse(response.content)
+                for entry in feed.entries[:15]: # Берем 15 самых свежих
+                    posts.append({
+                        "title": entry.title,
+                        "text": entry.summary,
+                        "link": entry.link
+                    })
+            else:
+                print(f"Reddit вернул ошибку: {response.status_code} для {url}")
         except Exception as e:
-            print(f"Ошибка парсинга Reddit: {e}")
+            print(f"Ошибка парсинга RSS: {e}")
+            
     return posts
 
 def analyze_with_ai(post):
@@ -54,12 +64,17 @@ def analyze_with_ai(post):
     """
     
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt
+        )
         result_text = response.text.strip()
         
-        # Убираем возможные маркеры Markdown, которые ИИ иногда добавляет
+        # Убираем возможные маркеры Markdown
         if result_text.startswith("```json"):
             result_text = result_text[7:-3]
+        elif result_text.startswith("```"):
+            result_text = result_text[3:-3]
             
         if result_text == "FALSE":
             return None
@@ -84,26 +99,27 @@ def send_to_google_sheets(ai_results):
 def main():
     print("Начинаем сканирование...")
     posts = fetch_reddit_posts()
+    print(f"Собрано постов для проверки: {len(posts)}")
     
-    # Ключевые слова для первичной фильтрации, чтобы не гонять ИИ впустую
-    keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'нашел', 'тайник', 'секрет']
+    # Ключевые слова для первичной фильтрации
+    keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'нашел', 'тайник', 'секрет', 'here']
     
     ai_results = []
     
     for post in posts:
         content = (post['title'] + " " + post['text']).lower()
         if any(word in content for word in keywords):
-            print(f"Анализируем подозрительный пост: {post['title']}")
+            print(f"Анализируем пост: {post['title']}")
             result = analyze_with_ai(post)
             if result:
+                print(f"ИИ нашел точку: {result['name']}")
                 ai_results.append(result)
-            time.sleep(2) # Пауза, чтобы не превысить лимиты API Gemini
             
     if ai_results:
         send_to_google_sheets(ai_results)
         print(f"Успешно обработано и отправлено {len(ai_results)} точек.")
     else:
-        print("Ничего ценного не найдено.")
+        print("Среди свежих постов ничего про точки на карте не найдено.")
 
 if __name__ == "__main__":
     main()
