@@ -84,8 +84,7 @@ def analyze_with_ai(post):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            # ВЕРНУЛИ МОДЕЛЬ, КОТОРАЯ ЖЕЛЕЗНО РАБОТАЕТ
-            model="llama-3.1-8b-instant", 
+            model="llama-3.3-70b-versatile",
             temperature=0.0,
         )
         result_text = chat_completion.choices[0].message.content.strip()
