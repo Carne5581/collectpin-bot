@@ -19,45 +19,59 @@ def load_seen_posts():
     return []
 
 def save_seen_posts(seen_list):
-    # Храним только последние 500 ID, чтобы файл не пух
+    # Храним только последние 1000 ID
     with open(LOG_FILE, 'w') as f:
-        json.dump(seen_list[-500:], f)
+        json.dump(seen_list[-1000:], f)
 
 def extract_image_from_html(html_content):
-    """Вытаскивает ссылку на картинку из поста Reddit"""
     match = re.search(r'<img[^>]+src="([^">]+)"', html_content)
     return match.group(1) if match else ""
 
-def fetch_reddit_posts(seen_posts):
-    url = "https://www.reddit.com/r/GTA6+GTA6_Mapping/new.rss?limit=100"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/3.0'}
+def fetch_all_sources(seen_posts):
+    """Качает данные с Reddit, YouTube и Google News"""
+    urls = [
+        # Reddit (Сразу оба сабреддита)
+        "https://www.reddit.com/r/GTA6+GTA6_Mapping/new.rss?limit=50",
+        # YouTube: GTA Series Videos
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC_nK_i3kOyyA_K3sA_4WnQg",
+        # YouTube: PowerPyx
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCWBA1-H9A5IldSb3JC5Tq1w",
+        # Google News (Поиск по фразе GTA 6 location found)
+        "https://news.google.com/rss/search?q=GTA+6+location+OR+found+OR+map&hl=en-US&gl=US&ceid=US:en"
+    ]
     
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/4.0'}
     posts = []
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            feed = feedparser.parse(response.content)
-            for entry in feed.entries:
-                post_id = entry.id
-                if post_id in seen_posts:
-                    continue # Пропускаем то, что уже видели
-                
-                posts.append({
-                    "id": post_id,
-                    "title": entry.title,
-                    "text": getattr(entry, 'summary', ''),
-                    "image_url": extract_image_from_html(getattr(entry, 'summary', '')),
-                    "link": entry.link
-                })
-    except Exception as e:
-        print(f"Ошибка RSS: {e}")
+    
+    for url in urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                feed = feedparser.parse(response.content)
+                for entry in feed.entries:
+                    # У YouTube свой формат ID, у Reddit свой. Берем то, что есть.
+                    post_id = getattr(entry, 'yt_videoid', getattr(entry, 'id', entry.link))
+                    
+                    if post_id in seen_posts:
+                        continue 
+                    
+                    posts.append({
+                        "id": post_id,
+                        "title": entry.title,
+                        "text": getattr(entry, 'summary', ''),
+                        "image_url": extract_image_from_html(getattr(entry, 'summary', '')),
+                        "link": entry.link
+                    })
+        except Exception as e:
+            print(f"Ошибка RSS ({url}): {e}")
+        time.sleep(2) # Пауза между разными сайтами
             
     return posts
 
 def analyze_with_ai(post):
     prompt = f"""
     Ты — строгий аналитик данных для интерактивной карты GTA 6. 
-    Прочитай этот пост с Reddit. Ищи ТОЛЬКО реальные находки (коллекционки, секреты, транспорт, пасхалки).
+    Прочитай этот текст. Ищи ТОЛЬКО реальные находки (коллекционки, секреты, транспорт, пасхалки).
     
     Заголовок: {post['title']}
     Текст: {post['text']}
@@ -74,21 +88,18 @@ def analyze_with_ai(post):
         "coord_y": "Координата Y (если есть, иначе пусто)"
     }}
     """
-    
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            # ИСПОЛЬЗУЕМ АКТУАЛЬНУЮ УМНУЮ МОДЕЛЬ GROQ
             model="llama-3.1-70b-versatile", 
             temperature=0.0,
         )
-        
         result_text = chat_completion.choices[0].message.content.strip()
         
         if "FALSE" in result_text.upper() and "{" not in result_text:
             return None
             
-        # Надежный парсинг JSON через Regex
+        # Вырезаем строго JSON
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if not json_match:
             return None
@@ -103,7 +114,20 @@ def analyze_with_ai(post):
 
 def main():
     seen_posts = load_seen_posts()
-    posts = fetch_reddit_posts(seen_posts)
+    posts = fetch_all_sources(seen_posts)
+    
+    # === ИСКУССТВЕННЫЙ ПОСТ ДЛЯ ПРОВЕРКИ ТАБЛИЦЫ ===
+    test_post = {
+        "id": "TEST_POST_002",
+        "title": "I found a hidden stash in Port Gellhorn!",
+        "text": "Hey guys, coordinates are X: 1540, Y: 200. It's right under the old bridge.",
+        "image_url": "https://example.com/test.jpg",
+        "link": "https://collectpin.com/test"
+    }
+    if test_post["id"] not in seen_posts:
+        posts.append(test_post)
+    # ===============================================
+
     print(f"Новых постов для проверки: {len(posts)}")
     
     keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'coordinate', 'x:', 'y:']
@@ -121,7 +145,7 @@ def main():
             if result:
                 print(f"✅ Найдено: {result['name']}")
                 ai_results.append(result)
-            time.sleep(1) # Пауза для лимитов API
+            time.sleep(2) 
             
     if ai_results:
         try:
@@ -130,7 +154,6 @@ def main():
         except Exception as e:
             print(f"Ошибка вебхука: {e}")
             
-    # Сохраняем логи, чтобы не проверять эти посты снова
     seen_posts.extend(new_seen_ids)
     save_seen_posts(seen_posts)
 
