@@ -108,18 +108,6 @@ def analyze_with_ai(post):
 def main():
     seen_posts = load_seen_posts()
     posts = fetch_all_sources(seen_posts)
-    
-    # === ИСКУССТВЕННЫЙ ПОСТ ===
-    test_post = {
-        "id": "TEST_POST_003",
-        "title": "I found a hidden stash in Port Gellhorn!",
-        "text": "Hey guys, coordinates are X: 1540, Y: 200. It's right under the old bridge.",
-        "image_url": "https://example.com/test.jpg",
-        "link": "https://collectpin.com/test"
-    }
-    if test_post["id"] not in seen_posts:
-        posts.append(test_post)
-    # ==========================
 
     print(f"Новых постов для проверки: {len(posts)}")
     
