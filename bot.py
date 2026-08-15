@@ -20,7 +20,7 @@ def fetch_reddit_posts():
     ]
     
     headers = {
-        'User-Agent': 'CollectPin-ScannerBot/1.0'
+        'User-Agent': 'CollectPin-ScannerBot/1.1'
     }
     
     posts = []
@@ -41,13 +41,13 @@ def fetch_reddit_posts():
         except Exception as e:
             print(f"Ошибка парсинга RSS: {e}")
             
-        # ПАУЗА 10 секунд, чтобы Reddit точно не забанил
-        time.sleep(10) 
+        # Увеличили паузу до 30 секунд, обходим жесткую защиту Reddit
+        time.sleep(30) 
             
     return posts
 
 def analyze_with_ai(post):
-    """Скармливает текст в Groq (Llama 3)"""
+    """Скармливает текст в актуальную модель Groq (Llama 3.1)"""
     prompt = f"""
     Ты — аналитик данных для интерактивной карты GTA 6. 
     Прочитай этот пост. Идет ли в нем речь о нахождении коллекционного предмета, секрета, редкого транспорта или тайника?
@@ -73,7 +73,8 @@ def analyze_with_ai(post):
                     "content": prompt,
                 }
             ],
-            model="llama3-8b-8192", # Бесплатная и очень быстрая модель
+            # ИСПОЛЬЗУЕМ НОВУЮ АКТУАЛЬНУЮ МОДЕЛЬ
+            model="llama-3.1-8b-instant", 
             temperature=0.1,
         )
         
@@ -122,7 +123,7 @@ def main():
                 print(f"ИИ нашел точку: {result['name']}")
                 ai_results.append(result)
                 
-            time.sleep(2) # Groq очень быстрый, большая пауза не нужна
+            time.sleep(2) 
             
     if ai_results:
         send_to_google_sheets(ai_results)
