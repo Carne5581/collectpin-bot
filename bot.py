@@ -34,7 +34,7 @@ def fetch_all_sources(seen_posts):
         "https://news.google.com/rss/search?q=GTA+6+location+OR+found+OR+map&hl=en-US&gl=US&ceid=US:en"
     ]
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/6.0'}
     posts = []
     
     for url in urls:
@@ -59,10 +59,23 @@ def fetch_all_sources(seen_posts):
             
     return posts
 
+def verify_evidence(evidence, original_text):
+    """ДЕТЕКТОР ЛЖИ: Проверяет, не выдумал ли ИИ цитату"""
+    if not evidence:
+        return ""
+    # Убираем пробелы и пунктуацию для жесткой проверки совпадения
+    clean_evidence = re.sub(r'\W+', '', evidence).lower()
+    clean_original = re.sub(r'\W+', '', original_text).lower()
+    
+    if clean_evidence and clean_evidence not in clean_original:
+        return f"⚠️ [ВЫДУМАНО ИИ?] {evidence}"
+    return evidence
+
 def analyze_with_ai(post):
+    """Возвращает: dict (кандидат), False (мусор), None (ошибка сервера)"""
     prompt = f"""
     Ты — строгий аналитик данных для интерактивной карты GTA 6. 
-    Прочитай этот текст. Твоя задача — определить, является ли это РЕАЛЬНОЙ находкой в игре (коллекционка, секрет, транспорт).
+    Прочитай этот текст. Твоя задача — определить, является ли это РЕАЛЬНОЙ находкой в игре.
     
     Заголовок: {post['title']}
     Текст: {post['text']}
@@ -73,8 +86,8 @@ def analyze_with_ai(post):
     3. Отвечай СТРОГО в формате JSON:
     {{
         "is_candidate": true или false,
-        "evidence": "Цитата из текста, почему ты решил, что это находка (или почему это мусор)",
-        "category": "тайник / транспорт / секрет / коллекционка" (если false, оставь пустым),
+        "evidence": "ТОЧНАЯ ЦИТАТА из текста на оригинальном языке, доказывающая находку (копируй слово в слово!)",
+        "category": "тайник / транспорт / секрет / коллекционка",
         "name": "Название предмета",
         "region": "Регион (если указан, иначе пусто)",
         "coord_x": "Координата X (ТОЛЬКО если есть в тексте, иначе пусто)",
@@ -86,23 +99,24 @@ def analyze_with_ai(post):
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.1-8b-instant", 
             temperature=0.0,
-            response_format={"type": "json_object"} # Заставляем Groq отдавать ТОЛЬКО JSON
+            response_format={"type": "json_object"} 
         )
         result_text = chat_completion.choices[0].message.content.strip()
-        
         data = json.loads(result_text)
         
-        # Если ИИ решил, что это мусор - возвращаем None
         if not data.get("is_candidate"):
-            print(f"Отбраковано. Причина: {data.get('evidence')}")
-            return None
+            return False # ИИ успешно понял, что это мусор
             
+        # Запускаем детектор лжи
+        full_text = post['title'] + " " + post['text']
+        data['evidence'] = verify_evidence(data.get('evidence', ''), full_text)
+        
         data['source_url'] = post['link']
         data['image_url'] = post['image_url']
         return data
     except Exception as e:
-        print(f"Ошибка ИИ: {e}")
-        return None
+        print(f"Ошибка ИИ (Сервер упал или лимиты): {e}")
+        return None # Возвращаем None, чтобы скрипт понял, что произошла ОШИБКА
 
 def main():
     seen_posts = load_seen_posts()
@@ -110,23 +124,38 @@ def main():
 
     print(f"Новых постов для проверки: {len(posts)}")
     
-    # Расширенный список ключей (Stage 1 Filter)
     keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'coordinate', 'x:', 'y:', 'guide', 'easter egg']
     ai_results = []
-    new_seen_ids = []
+    
+    # Сюда мы будем добавлять ID постов только при УСПЕШНОЙ обработке
+    successfully_processed_ids = []
     
     for post in posts:
-        new_seen_ids.append(post['id'])
         content = (post['title'] + " " + post['text']).lower()
         
         if any(word in content for word in keywords):
             print(f"Анализируем: {post['title']}")
             result = analyze_with_ai(post)
             
-            if result:
+            if result is None:
+                # КРИТИЧЕСКАЯ ЗАЩИТА: ИИ выдал ошибку (упал сервер). 
+                # Мы НЕ добавляем пост в прочитанные. Бот попробует снова через 15 минут.
+                print("Произошла ошибка ИИ. Откладываем пост до следующего запуска.")
+                continue
+                
+            elif result is False:
+                print("ИИ отбраковал пост (мусор/слух).")
+                successfully_processed_ids.append(post['id'])
+                
+            else:
                 print(f"✅ Кандидат найден: {result['name']}")
                 ai_results.append(result)
+                successfully_processed_ids.append(post['id'])
+                
             time.sleep(2) 
+        else:
+            # Пост отбракован по ключевым словам (мусор)
+            successfully_processed_ids.append(post['id'])
             
     if ai_results:
         try:
@@ -134,8 +163,12 @@ def main():
             print(f"Отправлено {len(ai_results)} кандидатов в таблицу.")
         except Exception as e:
             print(f"Ошибка вебхука: {e}")
+            # Если Гугл Таблица упала, мы не сохраняем successfully_processed_ids,
+            # чтобы при следующем запуске отправить эти точки заново!
+            return
             
-    seen_posts.extend(new_seen_ids)
+    # Сохраняем логи ТОЛЬКО для тех постов, которые прошли успешно
+    seen_posts.extend(successfully_processed_ids)
     save_seen_posts(seen_posts)
 
 if __name__ == "__main__":
