@@ -78,7 +78,8 @@ def analyze_with_ai(post):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama3-70b-8192", # Используем более умную модель
+            # ИСПОЛЬЗУЕМ АКТУАЛЬНУЮ УМНУЮ МОДЕЛЬ GROQ
+            model="llama-3.1-70b-versatile", 
             temperature=0.0,
         )
         
