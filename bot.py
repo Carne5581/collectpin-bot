@@ -19,7 +19,6 @@ def load_seen_posts():
     return []
 
 def save_seen_posts(seen_list):
-    # Храним только последние 1000 ID
     with open(LOG_FILE, 'w') as f:
         json.dump(seen_list[-1000:], f)
 
@@ -28,7 +27,6 @@ def extract_image_from_html(html_content):
     return match.group(1) if match else ""
 
 def fetch_all_sources(seen_posts):
-    """Качает данные с Reddit, YouTube и Google News"""
     urls = [
         "https://www.reddit.com/r/GTA6+GTA6_Mapping/new.rss?limit=50",
         "https://www.youtube.com/feeds/videos.xml?channel_id=UC_nK_i3kOyyA_K3sA_4WnQg",
@@ -36,7 +34,7 @@ def fetch_all_sources(seen_posts):
         "https://news.google.com/rss/search?q=GTA+6+location+OR+found+OR+map&hl=en-US&gl=US&ceid=US:en"
     ]
     
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/4.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/5.0'}
     posts = []
     
     for url in urls:
@@ -64,39 +62,41 @@ def fetch_all_sources(seen_posts):
 def analyze_with_ai(post):
     prompt = f"""
     Ты — строгий аналитик данных для интерактивной карты GTA 6. 
-    Прочитай этот текст. Ищи ТОЛЬКО реальные находки (коллекционки, секреты, транспорт, пасхалки).
+    Прочитай этот текст. Твоя задача — определить, является ли это РЕАЛЬНОЙ находкой в игре (коллекционка, секрет, транспорт).
     
     Заголовок: {post['title']}
     Текст: {post['text']}
     
     ПРАВИЛА:
-    1. Если это слух, мем, вопрос, обсуждение трейлера — ответь ТОЛЬКО словом FALSE.
-    2. Если это РЕАЛЬНАЯ находка, найди координаты (обычно в формате X, Y или [X,Y]).
-    3. Ответь СТРОГО в формате JSON без лишних слов:
+    1. Если это слух, новость, мем, обсуждение — установи "is_candidate": false.
+    2. НИКОГДА не выдумывай координаты! Если X и Y не написаны в тексте прямо, оставляй поля пустыми ("").
+    3. Отвечай СТРОГО в формате JSON:
     {{
-        "category": "тайник / транспорт / секрет / коллекционка",
+        "is_candidate": true или false,
+        "evidence": "Цитата из текста, почему ты решил, что это находка (или почему это мусор)",
+        "category": "тайник / транспорт / секрет / коллекционка" (если false, оставь пустым),
         "name": "Название предмета",
-        "region": "Регион (если указан, иначе Unknown)",
-        "coord_x": "Координата X (если есть, иначе пусто)",
-        "coord_y": "Координата Y (если есть, иначе пусто)"
+        "region": "Регион (если указан, иначе пусто)",
+        "coord_x": "Координата X (ТОЛЬКО если есть в тексте, иначе пусто)",
+        "coord_y": "Координата Y (ТОЛЬКО если есть в тексте, иначе пусто)"
     }}
     """
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant", 
             temperature=0.0,
+            response_format={"type": "json_object"} # Заставляем Groq отдавать ТОЛЬКО JSON
         )
         result_text = chat_completion.choices[0].message.content.strip()
         
-        if "FALSE" in result_text.upper() and "{" not in result_text:
+        data = json.loads(result_text)
+        
+        # Если ИИ решил, что это мусор - возвращаем None
+        if not data.get("is_candidate"):
+            print(f"Отбраковано. Причина: {data.get('evidence')}")
             return None
             
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-        if not json_match:
-            return None
-            
-        data = json.loads(json_match.group(0))
         data['source_url'] = post['link']
         data['image_url'] = post['image_url']
         return data
@@ -110,7 +110,8 @@ def main():
 
     print(f"Новых постов для проверки: {len(posts)}")
     
-    keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'coordinate', 'x:', 'y:']
+    # Расширенный список ключей (Stage 1 Filter)
+    keywords = ['found', 'location', 'map', 'collectible', 'hidden', 'secret', 'stash', 'wyman', 'coordinate', 'x:', 'y:', 'guide', 'easter egg']
     ai_results = []
     new_seen_ids = []
     
@@ -123,14 +124,14 @@ def main():
             result = analyze_with_ai(post)
             
             if result:
-                print(f"✅ Найдено: {result['name']}")
+                print(f"✅ Кандидат найден: {result['name']}")
                 ai_results.append(result)
             time.sleep(2) 
             
     if ai_results:
         try:
             requests.post(WEBHOOK_URL, json=ai_results)
-            print(f"Отправлено {len(ai_results)} точек в таблицу.")
+            print(f"Отправлено {len(ai_results)} кандидатов в таблицу.")
         except Exception as e:
             print(f"Ошибка вебхука: {e}")
             
