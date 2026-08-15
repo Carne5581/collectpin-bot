@@ -5,8 +5,8 @@ import google.generativeai as genai
 import time
 
 # Забираем секретные ключи из настроек GitHub
-GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6LamAuPrNE5GnQe8hX8toSzvWGalwC2liTplsWPFsdsjg")
-WEBHOOK_URL = os.environ.get("https://script.google.com/macros/s/AKfycbz8xMXfAgus8PeTn62j3TkKDwTGi3BZWctCybM_LMhG0cb-nyhiJJX4l82mB--1f6t9/exec")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
 # Настраиваем ИИ
 genai.configure(api_key=GEMINI_API_KEY)
