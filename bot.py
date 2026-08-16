@@ -79,20 +79,15 @@ LOG_FILE     = "seen_posts.json"
 #   https://www.reddit.com/r/ИМЯ/new.rss?limit=50
 #   Сначала открой reddit.com/r/ИМЯ и убедись, что он существует.
 
+# ВАЖНО: сабреддиты идут ЧЕРЕЗ ОДИН с остальными, а не подряд.
+# Reddit считает обращения по времени, и три запроса подряд он
+# отбивает ответом 429 — ровно это и случилось на первом запуске.
+# Когда между ними стоит YouTube, Reddit успевает остыть сам,
+# без длинного ожидания.
 SOURCES = [
     {
         "name": "Reddit · r/GTA6",
         "url": "https://www.reddit.com/r/GTA6/new.rss?limit=50",
-    },
-    {
-        "name": "Reddit · r/GTAVI",
-        "url": "https://www.reddit.com/r/GTAVI/new.rss?limit=50",
-    },
-    {
-        # Охотники за секретами GTA 5. После релиза этот народ
-        # первым полезет искать тайники в GTA 6.
-        "name": "Reddit · r/chiliadmystery",
-        "url": "https://www.reddit.com/r/chiliadmystery/new.rss?limit=50",
     },
     {
         # GTA Series Videos — самый авторитетный канал по GTA.
@@ -101,11 +96,21 @@ SOURCES = [
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCuWcjpKbIDAbZfHoru1toFg",
     },
     {
+        "name": "Reddit · r/GTAVI",
+        "url": "https://www.reddit.com/r/GTAVI/new.rss?limit=50",
+    },
+    {
         # PowerPyx — трофейные гайды, выходят в первые дни.
         # Адрес сверен: UCWBA1-H9A5IldSb3tNwQmtQ
         # В старой версии стояло UCWBA1-H9A5IldSb3JC5Tq1w — 404.
         "name": "YouTube · PowerPyx",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCWBA1-H9A5IldSb3tNwQmtQ",
+    },
+    {
+        # Охотники за секретами GTA 5. После релиза этот народ
+        # первым полезет искать тайники в GTA 6.
+        "name": "Reddit · r/chiliadmystery",
+        "url": "https://www.reddit.com/r/chiliadmystery/new.rss?limit=50",
     },
     {
         # TGG — гайды по GTA.
@@ -119,9 +124,40 @@ SOURCES = [
     },
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/7.0"
+# Reddit просит присылать своё, описательное имя программы, а не
+# притворяться браузером. Запросы от «браузера» с серверов дата-центра
+# он режет заметно охотнее.
+HEADERS_REDDIT = {
+    "User-Agent": "collectpin-scout/7.1 (+https://collectpin.com)",
+    "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8",
 }
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CollectPin-Scout/7.1",
+    "Accept": "application/rss+xml, application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+}
+
+# Сколько ждать после обращения к сайту, прежде чем идти к нему снова.
+# Reddit считает запросы по адресу сервера, а адреса у GitHub общие
+# на всех — то есть лимит мы делим с тысячами чужих ботов. Отсюда
+# длинная пауза именно для него.
+PAUZA = {
+    "www.reddit.com": 15,
+    "news.google.com": 3,
+    "www.youtube.com": 2,
+}
+PAUZA_PO_UMOLCHANIYU = 2
+
+
+def zagolovki_dlya(url):
+    return HEADERS_REDDIT if "reddit.com" in url else HEADERS
+
+
+def pauza_dlya(url):
+    for host, sek in PAUZA.items():
+        if host in url:
+            return sek
+    return PAUZA_PO_UMOLCHANIYU
 
 KEYWORDS = ["found", "location", "map", "collectible", "hidden", "secret",
             "stash", "wyman", "coordinate", "x:", "y:", "guide", "easter egg"]
@@ -167,20 +203,48 @@ def html_to_text(raw):
     return text[:4000]
 
 
-def fetch_feed(source):
-    """Возвращает (feed, oshibka). feed = None, если не получилось."""
-    try:
-        r = requests.get(source["url"], headers=HEADERS, timeout=15)
-    except Exception as e:
-        return None, f"сбой связи: {e}"
+def fetch_feed(source, popytok=3):
+    """Возвращает (feed, oshibka). feed = None, если не получилось.
 
-    if r.status_code != 200:
-        podskazka = ""
-        if r.status_code == 404:
+    Про повторы. Reddit отвечает 429 «слишком часто», когда к нему
+    приходят подряд. Это временный отказ, а не поломка: первый
+    сабреддит читается, а следующие два получают от ворот поворот.
+    Раньше бот на этом сдавался и терял два источника из трёх.
+    Теперь он ждёт и пробует ещё раз, с каждым разом дольше."""
+
+    url = source["url"]
+    posledniy_otvet = None
+
+    for popytka in range(popytok):
+        try:
+            r = requests.get(url, headers=zagolovki_dlya(url), timeout=20)
+        except Exception as e:
+            return None, f"сбой связи: {e}"
+
+        # Временный отказ — подождём и попробуем снова
+        if r.status_code in (429, 503) and popytka < popytok - 1:
+            zhdat = 20 * (popytka + 1)
+            print(f"    ответ {r.status_code} (просит подождать), "
+                  f"пауза {zhdat} c, попытка {popytka + 2} из {popytok}")
+            time.sleep(zhdat)
+            posledniy_otvet = r.status_code
+            continue
+
+        posledniy_otvet = r.status_code
+        break
+
+    if posledniy_otvet != 200:
+        if posledniy_otvet == 404:
             podskazka = " — такого канала или сабреддита не существует"
-        elif r.status_code in (403, 429):
-            podskazka = " — сайт блокирует запросы с серверов GitHub"
-        return None, f"ответ {r.status_code}{podskazka}"
+        elif posledniy_otvet == 429:
+            podskazka = (" — сайт просит обращаться реже. Это временно, "
+                         "не поломка. Если повторяется каждый день — "
+                         "увеличь паузу в блоке PAUZA")
+        elif posledniy_otvet == 403:
+            podskazka = " — сайт закрыл доступ серверам GitHub"
+        else:
+            podskazka = ""
+        return None, f"ответ {posledniy_otvet}{podskazka}"
 
     feed = feedparser.parse(r.content)
     if not feed.entries:
@@ -215,7 +279,7 @@ def rezhim_proverka():
             print(f"  свежее: {zagolovok[:70]}")
             print(f"  когда:  {data}")
 
-        time.sleep(2)
+        time.sleep(pauza_dlya(source["url"]))
 
     print("\n" + "=" * 64)
     print(f"ИТОГ: живых источников {zhivyh} из {len(SOURCES)}")
@@ -388,7 +452,7 @@ def rezhim_obychnyy():
 
         if oshibka:
             print(f"  ✗ {source['name']}: {oshibka}")
-            time.sleep(2)
+            time.sleep(pauza_dlya(source["url"]))
             continue
 
         novyh = 0
@@ -407,7 +471,7 @@ def rezhim_obychnyy():
             novyh += 1
 
         print(f"  ✓ {source['name']}: записей {len(feed.entries)}, новых {novyh}")
-        time.sleep(2)
+        time.sleep(pauza_dlya(source["url"]))
 
     print("=" * 64)
     print(f"Новых постов для проверки: {len(posts)}")
