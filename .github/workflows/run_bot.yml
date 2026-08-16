@@ -2,13 +2,27 @@ name: Run CollectPin Scanner
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # РАЗ В СУТКИ, 09:00 по Москве (06:00 UTC).
+    #
+    # Раньше стояло '*/15 * * * *' — каждые 15 минут, то есть
+    # 96 запусков в сутки и почти 3000 в месяц. У приватного
+    # репозитория бесплатные минуты не бесконечны, и до релиза
+    # игры оставалось четыре месяца холостого хода. Находок
+    # в природе пока нет: игра не вышла.
+    #
+    # 12 НОЯБРЯ, в день предзагрузки, поменяй строку ниже на:
+    #     - cron: '*/15 * * * *'
+    # и залей файл заново. Это единственная правка, которая
+    # понадобится к релизу.
+    - cron: '0 6 * * *'
+
+  # Кнопка ручного запуска: вкладка Actions → Run workflow.
+  # Пользуйся ей для проверки, не дожидаясь расписания.
   workflow_dispatch:
 
 permissions:
-  contents: write 
+  contents: write
 
-# ЗАЩИТА ОТ ПАРАЛЛЕЛЬНЫХ ЗАПУСКОВ (Совет ChatGPT)
 concurrency:
   group: collectpin-scanner
   cancel-in-progress: false
@@ -16,24 +30,30 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
+    # Если бот вдруг зависнет, он не будет крутиться час
+    # и жечь минуты. Десять минут ему хватает с запасом.
+    timeout-minutes: 10
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v7
-        
+
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: '3.12' # ОБНОВИЛИ ДО 3.12 (Броня на 2026-2027 годы)
-          
+          python-version: '3.12'
+
       - name: Install dependencies
         run: pip install requests groq feedparser
-        
+
       - name: Run Bot
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_URL:  ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_KEY:  ${{ secrets.WEBHOOK_KEY }}   # НОВЫЙ секрет — пароль Таблицы
         run: python bot.py
-        
+
       - name: Save seen posts log
         run: |
           git config --local user.email "action@github.com"
