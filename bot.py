@@ -88,22 +88,26 @@ SOURCES = [
     {
         "name": "Reddit · r/GTA6",
         "url": "https://www.reddit.com/r/GTA6/new.rss?limit=50",
+        "pro": "сабреддит про GTA 6",
     },
     {
         # GTA Series Videos — самый авторитетный канал по GTA.
         # Адрес сверен: UCuWcjpKbIDAbZfHoru1toFg
         "name": "YouTube · GTA Series Videos",
+        "pro": "канал про все игры серии GTA, включая старые",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCuWcjpKbIDAbZfHoru1toFg",
     },
     {
         "name": "Reddit · r/GTAVI",
         "url": "https://www.reddit.com/r/GTAVI/new.rss?limit=50",
+        "pro": "сабреддит про GTA 6",
     },
     {
         # PowerPyx — трофейные гайды, выходят в первые дни.
         # Адрес сверен: UCWBA1-H9A5IldSb3tNwQmtQ
         # В старой версии стояло UCWBA1-H9A5IldSb3JC5Tq1w — 404.
         "name": "YouTube · PowerPyx",
+        "pro": "канал с гайдами по разным играм, не только GTA",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCWBA1-H9A5IldSb3tNwQmtQ",
     },
     {
@@ -111,15 +115,22 @@ SOURCES = [
         # первым полезет искать тайники в GTA 6.
         "name": "Reddit · r/chiliadmystery",
         "url": "https://www.reddit.com/r/chiliadmystery/new.rss?limit=50",
+        # ВАЖНО: это сабреддит про секреты GTA 5, а не GTA 6.
+        # До релиза он приносит только находки из старой игры —
+        # именно они и попали в таблицу 17 августа. Держим его
+        # ради 19 ноября: эти люди первыми полезут искать в GTA 6.
+        "pro": "сабреддит про секреты GTA 5, НЕ про GTA 6",
     },
     {
         # TGG — гайды по GTA.
         # Адрес сверен: UC72PuhDwKtZ5MikpGNhPAtA
         "name": "YouTube · TGG",
+        "pro": "канал про GTA Online и GTA 5, иногда новости GTA 6",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC72PuhDwKtZ5MikpGNhPAtA",
     },
     {
         "name": "Google Новости · GTA 6 location/found/map",
+        "pro": "новостная выдача, много статей не про находки",
         "url": "https://news.google.com/rss/search?q=GTA+6+location+OR+found+OR+map&hl=en-US&gl=US&ceid=US:en",
     },
 ]
@@ -334,18 +345,32 @@ def verify_evidence(evidence, original_text):
 def analyze_with_ai(client, post):
     """Возвращает: dict (кандидат), False (мусор), None (ошибка сервера)"""
     prompt = f"""
-    Ты — строгий аналитик данных для интерактивной карты GTA 6.
-    Прочитай этот текст. Твоя задача — определить, является ли это РЕАЛЬНОЙ находкой в игре.
+    Ты — строгий аналитик данных для интерактивной карты GTA 6 (Grand Theft Auto VI).
+    Прочитай этот текст и определи, является ли это РЕАЛЬНОЙ находкой ИМЕННО В GTA 6.
+
+    Откуда пост: {post.get('istochnik', 'неизвестно')}
+    Про что этот источник: {post.get('pro', 'неизвестно')}
 
     Заголовок: {post['title']}
     Текст: {post['text']}
 
-    ПРАВИЛА:
-    1. Если это слух, новость, мем, обсуждение — установи "is_candidate": false.
+    ГЛАВНОЕ ПРАВИЛО, ПРОВЕРЬ ЕГО ПЕРВЫМ:
+    GTA 6 выходит 19 ноября 2026 года. На дату этого поста игра ЕЩЁ НЕ ВЫШЛА,
+    поэтому находок внутри GTA 6 существовать не может в принципе.
+    Если находка относится к GTA 5, GTA Online, GTA San Andreas, RDR 2
+    или любой другой игре — это НЕ наша находка, ставь "is_candidate": false.
+    Названия вроде Chiliad, Los Santos, Blaine County, Michael, Franklin,
+    Trevor, Cluckin Bell, Kortz Center — это GTA 5. Vice City, Leonida,
+    Port Gellhorn, Ambrosia, Jason, Lucia — это GTA 6.
+    Сомневаешься, какая игра — ставь "is_candidate": false.
+
+    ОСТАЛЬНЫЕ ПРАВИЛА:
+    1. Если это слух, новость, мем, обсуждение, трейлер — "is_candidate": false.
     2. НИКОГДА не выдумывай координаты! Если X и Y не написаны в тексте прямо, оставляй поля пустыми ("").
     3. Отвечай СТРОГО в формате JSON:
     {{
         "is_candidate": true или false,
+        "game": "точное название игры, о которой пост: GTA 6 / GTA 5 / RDR 2 / другое / непонятно",
         "evidence": "ТОЧНАЯ ЦИТАТА из текста на оригинальном языке, доказывающая находку (копируй слово в слово!)",
         "category": "тайник / транспорт / секрет / коллекционка",
         "name": "Название предмета",
@@ -366,8 +391,19 @@ def analyze_with_ai(client, post):
         if not data.get("is_candidate"):
             return False
 
+        # Вторая линия обороны: не полагаемся на то, что модель
+        # правильно поняла правило. 17 августа она пропустила восемь
+        # находок из GTA 5 с сабреддита r/chiliadmystery — все реальные,
+        # но не из той игры. Проверяем поле game сами.
+        igra = str(data.get("game", "")).lower()
+        nasha = any(k in igra for k in ["gta 6", "gta6", "gta vi", "gtavi", "grand theft auto vi"])
+        if not nasha:
+            print(f"  Отбраковано: пост про «{data.get('game', '?')}», а не про GTA 6.")
+            return False
+
         full_text = post["title"] + " " + post["text"]
         data["evidence"] = verify_evidence(data.get("evidence", ""), full_text)
+        data.pop("game", None)          # в лист не уходит, колонки не меняются
         data["source_url"] = post["link"]
         data["image_url"] = post["image_url"]
         return data
@@ -467,6 +503,8 @@ def rezhim_obychnyy():
                 "text": html_to_text(syroy),
                 "image_url": extract_image_from_html(syroy),
                 "link": entry.link,
+                "istochnik": source["name"],
+                "pro": source.get("pro", ""),
             })
             novyh += 1
 
