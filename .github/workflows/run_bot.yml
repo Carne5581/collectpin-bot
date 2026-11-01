@@ -2,16 +2,20 @@ name: Run CollectPin Scanner
 
 on:
   schedule:
-    # РАЗ В СУТКИ, 09:00 по Москве (06:00 UTC).
+    # Расписание переключается само, править ничего не нужно.
+    # Время в cron — по Гринвичу (UTC), Москва на 3 часа впереди.
+    # Минуты :07, :22, :37, :52 вместо :00 и :15 — в «круглые» минуты
+    # GitHub перегружен и задерживает запуски на часы.
     #
-    # Раньше стояло '*/15 * * * *' — каждые 15 минут, 96 запусков
-    # в сутки. У приватного репозитория бесплатные минуты не
-    # бесконечны, а до релиза игры четыре месяца холостого хода.
-    #
-    # 12 НОЯБРЯ поменяй строку ниже на:
-    #     - cron: '*/15 * * * *'
-    # Это единственная правка, которая понадобится к релизу.
-    - cron: '0 6 * * *'
+    # 1–11 ноября: раз в 6 часов — ищем громкие новости до релиза.
+    - cron: '7 */6 1-11 11 *'
+    # 12 ноября — 31 декабря: каждые 15 минут. Предзагрузка, релиз,
+    # первые находки. ВАЖНО: такой частоте нужен ПУБЛИЧНЫЙ репозиторий,
+    # у приватного бесплатные минуты кончатся примерно за неделю.
+    - cron: '7,22,37,52 * 12-30 11 *'
+    - cron: '7,22,37,52 * * 12 *'
+    # С января: раз в час.
+    - cron: '7 * * 1-10 *'
 
   # Кнопка ручного запуска с выбором режима.
   # Actions → Run CollectPin Scanner → Run workflow → выбрать режим.
@@ -23,9 +27,10 @@ on:
         default: 'obychnyy'
         type: choice
         options:
-          - obychnyy    # обычная работа: читать источники, слать в Таблицу
+          - obychnyy    # обычная работа: находки + новости
+          - novosti     # только новости для газеты
           - proverka    # только проверить источники, ничего не менять
-          - test        # отправить в Таблицу одну тестовую строку
+          - test        # отправить по одной тестовой строке в sbor_ai и gazeta
 
 permissions:
   contents: write
@@ -56,16 +61,21 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           WEBHOOK_URL:  ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_KEY:  ${{ secrets.WEBHOOK_KEY }}
+          NEWS_WEBHOOK_URL: ${{ secrets.NEWS_WEBHOOK_URL }}
+          NEWS_WEBHOOK_KEY: ${{ secrets.NEWS_WEBHOOK_KEY }}
           # По расписанию режим всегда обычный.
           # При ручном запуске берётся тот, что выбран в списке.
           MODE: ${{ github.event.inputs.rezhim || 'obychnyy' }}
         run: python bot.py
 
       - name: Save seen posts log
-        # В режимах proverka и test список прочитанного не меняется,
-        # поэтому коммита не будет — git сам увидит, что нечего сохранять.
+        # Сохраняем всегда, даже если бот покраснел: отчёт в README.md
+        # нужен именно тогда, когда что-то сломалось. Если бот решил
+        # не сохранять прочитанное (Таблица не приняла находки),
+        # seen_posts.json просто не изменится.
+        if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add seen_posts.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update seen posts log" && git push)
+          for f in seen_posts.json README.md news_seen.json; do if [ -f "$f" ]; then git add "$f"; fi; done
+          git diff --staged --quiet || (git commit -m "Update seen posts log" && git push)
