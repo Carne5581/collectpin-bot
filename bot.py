@@ -6,12 +6,22 @@ import html
 import requests
 import feedparser
 import time
+import difflib
+from datetime import datetime, timezone, timedelta
+from urllib.parse import quote_plus
 from groq import Groq
 
 # ==================================================================
 # CollectPin — ИИ-скаут
 #
-# У бота три режима. Переключаются кнопкой Run workflow на GitHub,
+# Две работы:
+#   1. НАХОДКИ — ищет посты о коллекционках GTA 6 и кладёт кандидатов
+#      в лист sbor_ai (как раньше).
+#   2. НОВОСТИ — с 1 ноября ищет самые громкие новости GTA 6 и кладёт
+#      черновики в лист gazeta. На сайт новость попадает, только когда
+#      владелец впишет «да» в колонку status.
+#
+# Режимы. Переключаются кнопкой Run workflow на GitHub,
 # в выпадающем списке.
 #
 #   obychnyy  — обычная работа: читает источники, показывает
@@ -23,8 +33,11 @@ from groq import Groq
 #               записей, заголовок самой свежей. Этим режимом
 #               проверяются адреса каналов и сабреддитов.
 #
+#   novosti   — только новости, без поиска находок.
+#
 #   test      — отправляет в Таблицу одну выдуманную находку
-#               с пометкой ТЕСТ. Нужен, чтобы убедиться, что
+#               с пометкой ТЕСТ (и одну тестовую новость в gazeta,
+#               если новостной вебхук настроен). Нужен, чтобы убедиться, что
 #               пароль и вебхук соединены. Без него это проверить
 #               нельзя: в обычном режиме бот молчит, пока в лентах
 #               нет новых постов, и непонятно, работает связь
@@ -54,6 +67,24 @@ from groq import Groq
 # 4. Модель читает текст, а не HTML с тегами.
 #
 # 5. Отправка идёт с паролем.
+#
+# ------------------------------------------------------------------
+# ЧТО ИСПРАВЛЕНО 1 НОЯБРЯ (версия 8)
+#
+# 1. Бот больше не отбрасывает ВСЁ после релиза. В подсказке модели
+#    было жёстко написано «игра ещё не вышла» — 19 ноября он отбраковал
+#    бы каждую настоящую находку. Теперь правило зависит от даты поста.
+#
+# 2. Если модель на Groq снимут с поддержки или упрётся в дневной
+#    лимит, бот пробует следующую из списка GROQ_MODELS.
+#
+# 3. Запуск краснеет, если сломалось важное: не читается ни один
+#    источник или ИИ не ответил ни разу. GitHub пришлёт письмо.
+#
+# 4. После каждого запуска бот пишет отчёт в README.md — он виден
+#    прямо на главной странице репозитория.
+#
+# 5. Новости для газеты (см. выше).
 # ==================================================================
 
 
@@ -61,6 +92,32 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 WEBHOOK_URL  = os.environ.get("WEBHOOK_URL")
 WEBHOOK_KEY  = os.environ.get("WEBHOOK_KEY")
 LOG_FILE     = "seen_posts.json"
+REPORT_FILE  = "README.md"
+
+# Новостной вебхук — отдельное веб-приложение Apps Script (файл
+# apps-script-gazeta.gs). Пароль тот, что вписан в нём.
+NEWS_WEBHOOK_URL = os.environ.get("NEWS_WEBHOOK_URL")
+NEWS_WEBHOOK_KEY = os.environ.get("NEWS_WEBHOOK_KEY")
+
+# Модели Groq по порядку. Первая не отвечает — берётся следующая.
+GROQ_MODELS = [m.strip() for m in os.environ.get(
+    "GROQ_MODELS",
+    "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant"
+).split(",") if m.strip()]
+
+# День релиза. До него находок в GTA 6 быть не может.
+RELIZ = datetime(2026, 11, 19, tzinfo=timezone.utc)
+
+# Сколько новостей за один запуск показывать ИИ. Бесплатный лимит
+# Groq — около 100 тысяч токенов в сутки на модель; при запуске
+# каждые 15 минут больше брать нельзя.
+NEWS_ZA_RAZ = 12
+# Порог «громкости» от 1 до 10: тише — в газету не предлагаем.
+NEWS_POROG = 6
+
+# Отчёт для README.md, собирается по ходу запуска
+OTCHET = {"istochniki": [], "ii_ok": 0, "ii_oshibki": 0, "model": "",
+          "nahodki": 0, "novosti": 0, "zametki": []}
 
 
 # ── ИСТОЧНИКИ ───────────────────────────────────────────────
@@ -135,6 +192,28 @@ SOURCES = [
     },
 ]
 
+# ── ИСТОЧНИКИ НОВОСТЕЙ ──────────────────────────────────────
+# Выдача Google Новостей за последние двое суток. Rockstar отдельно:
+# всё, что вышло на её сайте за неделю.
+def gnews(zapros, ru=False):
+    if ru:
+        return ("https://news.google.com/rss/search?q=" + quote_plus(zapros) +
+                "&hl=ru&gl=RU&ceid=RU:ru")
+    return ("https://news.google.com/rss/search?q=" + quote_plus(zapros) +
+            "&hl=en-US&gl=US&ceid=US:en")
+
+NEWS_SOURCES = [
+    {"name": "Новости · Rockstar",
+     "url": gnews('site:rockstargames.com "Grand Theft Auto VI" when:7d')},
+    {"name": "Новости · GTA 6 (англ.)",
+     "url": gnews('"GTA 6" OR "GTA VI" OR "Grand Theft Auto VI" when:2d')},
+    {"name": "Новости · GTA 6 (рус.)",
+     "url": gnews('GTA 6 when:2d', ru=True)},
+]
+
+NEWS_SLOVA = ["gta 6", "gta vi", "gta6", "grand theft auto vi", "гта 6", "гта6"]
+
+
 # Reddit просит присылать своё, описательное имя программы, а не
 # притворяться браузером. Запросы от «браузера» с серверов дата-центра
 # он режет заметно охотнее.
@@ -189,7 +268,7 @@ def load_seen_posts():
 
 def save_seen_posts(seen_list):
     with open(LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen_list[-2000:], f)
+        json.dump(seen_list[-5000:], f)
 
 
 def extract_image_from_html(raw):
@@ -274,7 +353,7 @@ def rezhim_proverka():
 
     zhivyh = 0
 
-    for source in SOURCES:
+    for source in SOURCES + NEWS_SOURCES:
         print(f"\n{source['name']}")
         feed, oshibka = fetch_feed(source)
 
@@ -293,8 +372,10 @@ def rezhim_proverka():
         time.sleep(pauza_dlya(source["url"]))
 
     print("\n" + "=" * 64)
-    print(f"ИТОГ: живых источников {zhivyh} из {len(SOURCES)}")
-    if zhivyh < len(SOURCES):
+    vsego = len(SOURCES) + len(NEWS_SOURCES)
+    print(f"ИТОГ: живых источников {zhivyh} из {vsego}")
+    print(f"Модели ИИ по порядку: {', '.join(GROQ_MODELS)}")
+    if zhivyh < vsego:
         print("Строки с ✗ надо поправить или удалить в блоке SOURCES в bot.py.")
     print("=" * 64)
 
@@ -319,12 +400,35 @@ def rezhim_test():
         "image_url": "",
     }]
 
-    if send_to_sheet(proba):
+    ok = send_to_sheet(proba)
+    if ok:
         print("\nГотово. Открой лист sbor_ai — там должна появиться строка")
         print(f"с пометкой ТЕСТ и меткой {metka}. Её можно удалить.")
         print("Связь бота с Таблицей работает.")
     else:
         print("\nСвязь не работает. Разбор причины — в строках выше.")
+
+    print("\n" + "=" * 64)
+    print("ТЕСТ СВЯЗИ С ЛИСТОМ gazeta")
+    print("=" * 64)
+    if not NEWS_WEBHOOK_URL:
+        print("NEWS_WEBHOOK_URL не задан — новостной вебхук ещё не подключён.")
+        print("Это не ошибка, если газету пока не настраивали.")
+    else:
+        test_news = [{
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "title_ru": "ТЕСТ — можно удалить", "text_ru": f"Проверка связи, метка {metka}",
+            "title_en": "TEST — delete me", "text_en": f"Connection check, tag {metka}",
+            "source": f"https://collectpin.com/TEST-NEWS-{metka}", "tag": "", "hype": 0,
+            "note": "Тестовая строка от бота",
+        }]
+        if send_news(test_news):
+            print("\nГотово. В листе gazeta появилась строка «ТЕСТ — можно удалить».")
+            print("В status она пустая, поэтому на сайт не попадёт. Удали её.")
+        else:
+            ok = False
+            print("\nНовостной вебхук не работает. Разбор — в строках выше.")
+    if not ok:
         sys.exit(1)
 
 
@@ -342,6 +446,67 @@ def verify_evidence(evidence, original_text):
     return evidence
 
 
+MERTVYE_MODELI = set()
+II_STOP = False   # все модели упёрлись в лимит — до конца запуска не трогаем ИИ
+
+
+def sprosit_ii(client, prompt):
+    """Спрашивает модели по очереди. Возвращает dict или None."""
+    global II_STOP
+    if II_STOP:
+        return None
+    limit_u_vseh = True
+    for model in GROQ_MODELS:
+        if model in MERTVYE_MODELI:
+            continue
+        try:
+            otvet = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            data = json.loads(otvet.choices[0].message.content.strip())
+            OTCHET["ii_ok"] += 1
+            OTCHET["model"] = model
+            return data
+        except Exception as e:
+            tekst = str(e).lower()
+            if any(k in tekst for k in ["decommission", "model_not_found", "does not exist", "not found", "unsupported"]):
+                print(f"  Модель {model} недоступна: {str(e)[:160]}. Беру следующую.")
+                MERTVYE_MODELI.add(model)
+                OTCHET["zametki"].append(f"модель {model} недоступна")
+                continue
+            if "429" in tekst or "rate limit" in tekst or "rate_limit" in tekst:
+                print(f"  Модель {model} упёрлась в лимит. Беру следующую.")
+                MERTVYE_MODELI.add(model)
+                continue
+            limit_u_vseh = False
+            print(f"  Ошибка ИИ ({model}): {str(e)[:200]}")
+            OTCHET["ii_oshibki"] += 1
+            return None
+    if limit_u_vseh:
+        II_STOP = True
+        OTCHET["zametki"].append("все модели упёрлись в лимит Groq")
+        print("  Все модели недоступны или упёрлись в лимит — ИИ до конца запуска не трогаю.")
+    OTCHET["ii_oshibki"] += 1
+    return None
+
+
+def pravilo_daty(post):
+    """Правило про дату для подсказки модели."""
+    kogda = post.get("published")
+    if kogda and kogda < RELIZ:
+        return (f"Пост опубликован {kogda.strftime('%d.%m.%Y')}, ДО выхода GTA 6 "
+                "(19 ноября 2026). Находок внутри GTA 6 в нём быть не может — "
+                "ставь \"is_candidate\": false.")
+    if not kogda and datetime.now(timezone.utc) < RELIZ:
+        return ("GTA 6 выходит 19 ноября 2026 года и ещё НЕ ВЫШЛА, поэтому "
+                "находок внутри GTA 6 существовать не может — ставь \"is_candidate\": false.")
+    return ("GTA 6 уже вышла (19 ноября 2026), находки в ней возможны. "
+            "Но пост должен описывать конкретный предмет или место в игре.")
+
+
 def analyze_with_ai(client, post):
     """Возвращает: dict (кандидат), False (мусор), None (ошибка сервера)"""
     prompt = f"""
@@ -355,8 +520,7 @@ def analyze_with_ai(client, post):
     Текст: {post['text']}
 
     ГЛАВНОЕ ПРАВИЛО, ПРОВЕРЬ ЕГО ПЕРВЫМ:
-    GTA 6 выходит 19 ноября 2026 года. На дату этого поста игра ЕЩЁ НЕ ВЫШЛА,
-    поэтому находок внутри GTA 6 существовать не может в принципе.
+    {pravilo_daty(post)}
     Если находка относится к GTA 5, GTA Online, GTA San Andreas, RDR 2
     или любой другой игре — это НЕ наша находка, ставь "is_candidate": false.
     Названия вроде Chiliad, Los Santos, Blaine County, Michael, Franklin,
@@ -380,13 +544,9 @@ def analyze_with_ai(client, post):
     }}
     """
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-            temperature=0.0,
-            response_format={"type": "json_object"},
-        )
-        data = json.loads(chat_completion.choices[0].message.content.strip())
+        data = sprosit_ii(client, prompt)
+        if data is None:
+            return None
 
         if not data.get("is_candidate"):
             return False
@@ -409,7 +569,7 @@ def analyze_with_ai(client, post):
         return data
 
     except Exception as e:
-        print(f"  Ошибка ИИ (сервер упал или лимиты): {e}")
+        print(f"  Ошибка разбора ответа ИИ: {e}")
         return None
 
 
@@ -466,9 +626,244 @@ def send_to_sheet(ai_results):
     return True
 
 
+def send_news(items):
+    """Отправляет черновики новостей в лист gazeta. True — если записаны."""
+    if not NEWS_WEBHOOK_URL:
+        print("NEWS_WEBHOOK_URL не задан — новости отправлять некуда.")
+        return False
+    if not NEWS_WEBHOOK_KEY:
+        print("NEWS_WEBHOOK_KEY не задан. Добавь секрет на GitHub.")
+        return False
+    try:
+        r = requests.post(NEWS_WEBHOOK_URL,
+                          json={"key": NEWS_WEBHOOK_KEY, "items": items},
+                          timeout=60)
+    except Exception as e:
+        print(f"Новостной вебхук недоступен: {e}")
+        return False
+    if r.status_code != 200:
+        print(f"Лист gazeta ответил кодом {r.status_code}. Ответ: {r.text[:300]}")
+        return False
+    try:
+        otvet = r.json()
+    except Exception:
+        print("Новостной вебхук ответил не JSON. Проверь, что развёрнут")
+        print("с доступом «Все» и после правки сделан Deploy → New version.")
+        print(f"Ответ: {r.text[:300]}")
+        return False
+    if otvet.get("status") != "success":
+        print(f"Лист gazeta отказался записывать: {otvet}")
+        return False
+    print(f"Лист gazeta принял. Добавлено: {otvet.get('dobavleno')}, "
+          f"пропущено (повторы): {otvet.get('propuscheno')}")
+    return True
+
+
+# ── НОВОСТИ ДЛЯ ГАЗЕТЫ ──────────────────────────────────────
+
+NEWS_LOG = "news_seen.json"   # заголовки уже предложенных новостей
+
+
+def chisla(tekst):
+    return set(re.findall(r"\d+", tekst or ""))
+
+
+def analyze_news(client, post):
+    """dict — черновик новости, False — неинтересно, None — ошибка ИИ."""
+    prompt = f"""
+    Ты — редактор игровой газеты про GTA 6 (Grand Theft Auto VI) для игроков.
+    Сегодня {datetime.now(timezone.utc).strftime('%d.%m.%Y')}. Релиз GTA 6 — 19 ноября 2026.
+    Реши, стоит ли этот материал показать игрокам как НОВОСТЬ.
+
+    Заголовок: {post['title']}
+    Описание: {post['text'][:600]}
+    Издание: {post.get('izdanie', '')}
+
+    НОВОСТЬ — это свежий факт: официальное заявление Rockstar или Take-Two,
+    трейлер, дата, цена, предзагрузка, новые детали игры или геймплея,
+    крупная утечка, перенос, рекорд, громкое событие вокруг игры.
+    НЕ новость: мнения, «10 вещей, которые мы хотим», догадки, теории фанатов,
+    гайды, обзоры старых новостей, материалы про другие игры.
+
+    hype — насколько это взорвёт сообщество игроков, от 1 до 10.
+    Официальный трейлер или дата — 9–10. Новые детали геймплея — 7–8.
+    Крупная утечка — 7–8. Мелкая подробность или пересказ — 3–5.
+
+    kind: "официально" — если это сказала или показала Rockstar/Take-Two,
+    "утечка" — слив, "слух" — неподтверждённое, "другое" — всё прочее.
+
+    ПРАВИЛА ТЕКСТА:
+    - Пиши ТОЛЬКО то, что есть в заголовке и описании. Ничего не добавляй.
+      Никаких цифр, имён и дат, которых нет в тексте выше.
+    - title_ru и title_en — до 60 знаков, живо, без кликбейта и капслока.
+    - text_ru и text_en — 1–2 коротких предложения, до 200 знаков.
+    - Русский — простой разговорный, на «ты» не обращайся.
+
+    Отвечай СТРОГО JSON:
+    {{
+      "is_news": true или false,
+      "hype": число 1–10,
+      "kind": "официально / утечка / слух / другое",
+      "title_ru": "...", "text_ru": "...",
+      "title_en": "...", "text_en": "..."
+    }}
+    """
+    data = sprosit_ii(client, prompt)
+    if data is None:
+        return None
+    if not data.get("is_news"):
+        return False
+    try:
+        hype = int(data.get("hype", 0))
+    except Exception:
+        hype = 0
+    if hype < NEWS_POROG:
+        return False
+
+    # Детектор выдумки: числа в тексте модели должны быть в исходнике
+    ishodnik = chisla(post["title"] + " " + post["text"])
+    lishnie = (chisla(data.get("text_ru", "")) | chisla(data.get("text_en", "")) |
+               chisla(data.get("title_ru", "")) | chisla(data.get("title_en", ""))) - ishodnik - {"6"}
+    zametka = post.get("izdanie", "")
+    if lishnie:
+        zametka = f"⚠️ числа {', '.join(sorted(lishnie))} не из заголовка — проверь. " + zametka
+
+    kind = str(data.get("kind", "")).lower()
+    return {
+        "date": (post.get("published") or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
+        "title_ru": str(data.get("title_ru", ""))[:90],
+        "text_ru": str(data.get("text_ru", ""))[:260],
+        "title_en": str(data.get("title_en", ""))[:90],
+        "text_en": str(data.get("text_en", ""))[:260],
+        "source": post["link"],
+        "tag": "слух" if ("утеч" in kind or "слух" in kind) else "",
+        "hype": hype,
+        "note": zametka.strip(),
+    }
+
+
+def pohozhe(a, b):
+    a = re.sub(r"[^a-zа-яё0-9 ]", "", (a or "").lower())
+    b = re.sub(r"[^a-zа-яё0-9 ]", "", (b or "").lower())
+    return difflib.SequenceMatcher(None, a, b).ratio() > 0.6
+
+
+def sobrat_novosti(client, seen_posts, obrabotano):
+    """Читает новостные ленты, отбирает громкое. Возвращает черновики."""
+    if not NEWS_WEBHOOK_URL:
+        print("\nНовости: вебхук не подключён (NEWS_WEBHOOK_URL), пропускаю.")
+        return []
+
+    try:
+        with open(NEWS_LOG, "r", encoding="utf-8") as f:
+            uzhe = json.load(f)
+    except Exception:
+        uzhe = []
+
+    print("\n" + "=" * 64)
+    print("НОВОСТИ")
+    print("=" * 64)
+    kandidaty = []
+    for source in NEWS_SOURCES:
+        feed, oshibka = fetch_feed(source)
+        if oshibka:
+            print(f"  ✗ {source['name']}: {oshibka}")
+            OTCHET["istochniki"].append((source["name"], False, oshibka))
+            time.sleep(pauza_dlya(source["url"]))
+            continue
+        novyh = 0
+        for entry in feed.entries:
+            pid = "news:" + str(getattr(entry, "id", entry.link))
+            if pid in seen_posts:
+                continue
+            zag = getattr(entry, "title", "")
+            if not any(s in zag.lower() for s in NEWS_SLOVA):
+                obrabotano.append(pid)
+                continue
+            p = getattr(entry, "published_parsed", None)
+            kandidaty.append({
+                "id": pid, "title": zag,
+                "text": html_to_text(getattr(entry, "summary", "")),
+                "link": entry.link,
+                "izdanie": getattr(getattr(entry, "source", None), "title", "") if hasattr(entry, "source") else "",
+                "published": datetime(*p[:6], tzinfo=timezone.utc) if p else None,
+            })
+            novyh += 1
+        print(f"  ✓ {source['name']}: записей {len(feed.entries)}, новых про GTA 6 {novyh}")
+        OTCHET["istochniki"].append((source["name"], True, f"{len(feed.entries)} записей"))
+        time.sleep(pauza_dlya(source["url"]))
+
+    # Сначала свежие. Похожие заголовки (одна новость в десяти изданиях)
+    # отсекаем ещё до ИИ, чтобы не тратить лимит.
+    kandidaty.sort(key=lambda x: x["published"] or datetime.now(timezone.utc), reverse=True)
+    otobrany, ostalos = [], []
+    for k in kandidaty:
+        if any(pohozhe(k["title"], z) for z in uzhe[-400:]) or any(pohozhe(k["title"], o["title"]) for o in otobrany):
+            obrabotano.append(k["id"])
+            continue
+        (otobrany if len(otobrany) < NEWS_ZA_RAZ else ostalos).append(k)
+    # Не влезшие в лимит не помечаем — заберём в следующий запуск.
+    print(f"Новостей на проверку ИИ: {len(otobrany)} (отложено до следующего раза: {len(ostalos)})")
+
+    gotovo = []
+    for k in otobrany:
+        print(f"Новость? {k['title'][:80]}")
+        r = analyze_news(client, k)
+        if r is None:
+            print("  Откладываем до следующего запуска.")
+            continue
+        obrabotano.append(k["id"])
+        uzhe.append(k["title"])
+        if r is False:
+            print("  Тихая или не новость.")
+        else:
+            if any(pohozhe(r["title_en"], g["title_en"]) for g in gotovo):
+                print("  Повтор уже отобранной.")
+                continue
+            print(f"  📰 Громкость {r['hype']}: {r['title_ru']}")
+            gotovo.append(r)
+            uzhe.append(r["title_en"])
+        time.sleep(2)
+
+    with open(NEWS_LOG, "w", encoding="utf-8") as f:
+        json.dump(uzhe[-1000:], f, ensure_ascii=False)
+    return gotovo
+
+
+# ── ОТЧЁТ В README.md ───────────────────────────────────────
+
+def zapisat_otchet(rezhim):
+    msk = datetime.now(timezone.utc) + timedelta(hours=3)
+    stroki = [
+        "# CollectPin — ИИ-скаут",
+        "",
+        "Этот файл бот переписывает после каждого запуска. Здесь видно, жив ли он.",
+        "",
+        f"**Последний запуск:** {msk.strftime('%d.%m.%Y %H:%M')} по Москве, режим `{rezhim}`",
+        "",
+        "| Источник | | |",
+        "|---|---|---|",
+    ]
+    for imya, ok, chto in OTCHET["istochniki"]:
+        stroki.append(f"| {imya} | {'✓' if ok else '✗'} | {chto} |")
+    stroki += [
+        "",
+        f"- ИИ ответил: **{OTCHET['ii_ok']}** раз, ошибок: **{OTCHET['ii_oshibki']}**"
+        + (f", модель `{OTCHET['model']}`" if OTCHET["model"] else ""),
+        f"- Находок отправлено в `sbor_ai`: **{OTCHET['nahodki']}**",
+        f"- Новостей отправлено в `gazeta`: **{OTCHET['novosti']}**",
+    ]
+    for z in OTCHET["zametki"]:
+        stroki.append(f"- ⚠️ {z}")
+    stroki += ["", "Строка с ✗ — источник не ответил. Если ✗ держится несколько дней подряд,",
+               "запусти режим `proverka` и пришли его вывод."]
+    with open(REPORT_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(stroki) + "\n")
+
+
 # ── РЕЖИМ: ОБЫЧНЫЙ ──────────────────────────────────────────
 
-def rezhim_obychnyy():
+def rezhim_obychnyy(tolko_novosti=False):
     if not GROQ_API_KEY:
         print("GROQ_API_KEY не задан. Без него анализировать нечем.")
         sys.exit(1)
@@ -483,11 +878,12 @@ def rezhim_obychnyy():
     print("=" * 64)
 
     posts = []
-    for source in SOURCES:
+    for source in ([] if tolko_novosti else SOURCES):
         feed, oshibka = fetch_feed(source)
 
         if oshibka:
             print(f"  ✗ {source['name']}: {oshibka}")
+            OTCHET["istochniki"].append((source["name"], False, oshibka))
             time.sleep(pauza_dlya(source["url"]))
             continue
 
@@ -497,7 +893,9 @@ def rezhim_obychnyy():
             if post_id in seen_posts:
                 continue
             syroy = getattr(entry, "summary", "")
+            p = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
             posts.append({
+                "published": datetime(*p[:6], tzinfo=timezone.utc) if p else None,
                 "id": post_id,
                 "title": entry.title,
                 "text": html_to_text(syroy),
@@ -509,15 +907,11 @@ def rezhim_obychnyy():
             novyh += 1
 
         print(f"  ✓ {source['name']}: записей {len(feed.entries)}, новых {novyh}")
+        OTCHET["istochniki"].append((source["name"], True, f"{len(feed.entries)} записей, новых {novyh}"))
         time.sleep(pauza_dlya(source["url"]))
 
     print("=" * 64)
     print(f"Новых постов для проверки: {len(posts)}")
-
-    if not posts:
-        print("Проверять нечего. Выходим, ничего не меняя.")
-        print("Это нормально: в лентах пока нет постов, которых бот не видел.")
-        return
 
     ai_results = []
     obrabotano = []
@@ -552,13 +946,44 @@ def rezhim_obychnyy():
         if not send_to_sheet(ai_results):
             print("Отправка не удалась. Список прочитанного НЕ сохраняю,")
             print("чтобы находки не потерялись — попробуем в следующий раз.")
+            OTCHET["zametki"].append("Таблица не приняла находки — повтор в следующий запуск")
+            zapisat_otchet("obychnyy")
             sys.exit(1)
+        OTCHET["nahodki"] = len(ai_results)
     else:
         print("\nКандидатов нет — отправлять нечего.")
 
+    # Новости: их сбой не мешает находкам, поэтому отдельно
+    news_obrabotano = []
+    try:
+        novosti = sobrat_novosti(client, seen_posts, news_obrabotano)
+    except Exception as e:
+        print(f"Новости упали: {e}")
+        OTCHET["zametki"].append(f"сбор новостей упал: {str(e)[:120]}")
+        novosti, news_obrabotano = [], []
+    if novosti:
+        print(f"\nОтправляю новостей в gazeta: {len(novosti)}")
+        if send_news(novosti):
+            OTCHET["novosti"] = len(novosti)
+            obrabotano.extend(news_obrabotano)
+        else:
+            OTCHET["zametki"].append("лист gazeta не принял новости — повтор в следующий запуск")
+    else:
+        obrabotano.extend(news_obrabotano)
+
     seen_list.extend(obrabotano)
     save_seen_posts(seen_list)
-    print(f"Готово. В списке прочитанного: {len(seen_list[-2000:])}")
+    zapisat_otchet("novosti" if tolko_novosti else "obychnyy")
+    print(f"Готово. В списке прочитанного: {len(seen_list[-5000:])}")
+
+    # Запуск краснеет, если сломалось важное — GitHub пришлёт письмо
+    zhivyh = sum(1 for _, ok, _ in OTCHET["istochniki"] if ok)
+    if OTCHET["istochniki"] and zhivyh == 0:
+        print("\nОШИБКА: не ответил ни один источник.")
+        sys.exit(1)
+    if OTCHET["ii_ok"] == 0 and OTCHET["ii_oshibki"] > 0:
+        print("\nОШИБКА: ИИ не ответил ни разу. Проверь ключ GROQ_API_KEY и список моделей.")
+        sys.exit(1)
 
 
 # ── ЗАПУСК ──────────────────────────────────────────────────
@@ -578,9 +1003,11 @@ def main():
         rezhim_test()
     elif rezhim == "obychnyy":
         rezhim_obychnyy()
+    elif rezhim == "novosti":
+        rezhim_obychnyy(tolko_novosti=True)
     else:
         print(f"Неизвестный режим: {rezhim}")
-        print("Бывают: obychnyy, proverka, test")
+        print("Бывают: obychnyy, novosti, proverka, test")
         sys.exit(1)
 
 
