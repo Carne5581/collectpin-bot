@@ -153,6 +153,7 @@ SOURCES = [
         "name": "YouTube · GTA Series Videos",
         "pro": "канал про все игры серии GTA, включая старые",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCuWcjpKbIDAbZfHoru1toFg",
+        "yt": "@GTASeriesVideos",
     },
     {
         "name": "Reddit · r/GTAVI",
@@ -166,6 +167,7 @@ SOURCES = [
         "name": "YouTube · PowerPyx",
         "pro": "канал с гайдами по разным играм, не только GTA",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCWBA1-H9A5IldSb3tNwQmtQ",
+        "yt": "@PowerPyx",
     },
     {
         # Охотники за секретами GTA 5. После релиза этот народ
@@ -184,6 +186,7 @@ SOURCES = [
         "name": "YouTube · TGG",
         "pro": "канал про GTA Online и GTA 5, иногда новости GTA 6",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC72PuhDwKtZ5MikpGNhPAtA",
+        "yt": "@TGG",
     },
     {
         "name": "Google Новости · GTA 6 location/found/map",
@@ -293,7 +296,41 @@ def html_to_text(raw):
     return text[:4000]
 
 
+YT_ID = re.compile(r'(?:"externalId"|"channelId")\s*:\s*"(UC[\w-]{22})"|channel/(UC[\w-]{22})')
+
+
+def youtube_id_po_imeni(imya):
+    """Находит настоящий номер канала (UC…) по его @имени.
+    Номера в ленте иногда устаревают или вписаны с ошибкой — тогда
+    лента отвечает 404/500, а страница канала по @имени работает."""
+    try:
+        r = requests.get("https://www.youtube.com/" + imya, headers=HEADERS, timeout=20,
+                         cookies={"CONSENT": "YES+1"})
+        if r.status_code != 200:
+            return None
+        m = YT_ID.search(r.text)
+        return (m.group(1) or m.group(2)) if m else None
+    except Exception:
+        return None
+
+
 def fetch_feed(source, popytok=3):
+    feed, oshibka = _fetch_feed(source, popytok)
+    if oshibka and source.get("yt"):
+        nomer = youtube_id_po_imeni(source["yt"])
+        if nomer:
+            novyy = dict(source, url="https://www.youtube.com/feeds/videos.xml?channel_id=" + nomer)
+            feed2, oshibka2 = _fetch_feed(novyy, popytok)
+            if not oshibka2:
+                print(f"    {source['yt']}: номер канала {nomer} — поправь его в SOURCES")
+                OTCHET["zametki"].append(f"{source['name']}: рабочий номер канала {nomer} (найден по {source['yt']})")
+                return feed2, None
+            return None, f"{oshibka}; по {source['yt']} найден {nomer}, но лента тоже не ответила: {oshibka2}"
+        return None, f"{oshibka}; канал {source['yt']} не нашёлся"
+    return feed, oshibka
+
+
+def _fetch_feed(source, popytok=3):
     """Возвращает (feed, oshibka). feed = None, если не получилось.
 
     Про повторы. Reddit отвечает 429 «слишком часто», когда к нему
@@ -447,6 +484,31 @@ def verify_evidence(evidence, original_text):
 
 
 MERTVYE_MODELI = set()
+START = time.time()
+# GitHub обрывает запуск на 10-й минуте (timeout-minutes в run_bot.yml).
+# Раньше бот ждал Groq по кругу и не успевал записать отчёт — запуск
+# 2 ноября был отменён. Теперь после 7 минут ИИ больше не спрашиваем.
+II_DEDLAYN = 7 * 60
+
+
+def vybrat_modeli(client):
+    """Спрашивает у Groq, какие модели сейчас есть, и строит порядок:
+    сначала наши любимые из GROQ_MODELS, затем любые другие текстовые."""
+    global GROQ_MODELS
+    try:
+        est = [m.id for m in client.models.list().data]
+    except Exception as e:
+        print(f"Список моделей Groq не получен ({str(e)[:120]}), беру свой.")
+        return
+    lishnie = ("whisper", "guard", "tts", "playai", "orpheus", "prompt", "distil", "compound", "allam")
+    tekstovye = [m for m in est if not any(x in m.lower() for x in lishnie)]
+    nashi = [m for m in GROQ_MODELS if m in est]
+    drugie = sorted(m for m in tekstovye if m not in nashi)
+    ubrany = [m for m in GROQ_MODELS if m not in est]
+    if ubrany:
+        OTCHET["zametki"].append("Groq больше не даёт: " + ", ".join(ubrany))
+    GROQ_MODELS = (nashi + drugie)[:5] or GROQ_MODELS
+    print("Модели ИИ по порядку: " + ", ".join(GROQ_MODELS))
 II_STOP = False   # все модели упёрлись в лимит — до конца запуска не трогаем ИИ
 
 
@@ -454,6 +516,10 @@ def sprosit_ii(client, prompt):
     """Спрашивает модели по очереди. Возвращает dict или None."""
     global II_STOP
     if II_STOP:
+        return None
+    if time.time() - START > II_DEDLAYN:
+        II_STOP = True
+        OTCHET["zametki"].append("время запуска вышло — остальное в следующий раз")
         return None
     limit_u_vseh = True
     for model in GROQ_MODELS:
@@ -868,7 +934,9 @@ def rezhim_obychnyy(tolko_novosti=False):
         print("GROQ_API_KEY не задан. Без него анализировать нечем.")
         sys.exit(1)
 
-    client = Groq(api_key=GROQ_API_KEY)
+    # max_retries=0: на лимите Groq сам ждал минутами, и запуск не укладывался в 10 минут
+    client = Groq(api_key=GROQ_API_KEY, max_retries=0, timeout=40)
+    vybrat_modeli(client)
 
     seen_list  = load_seen_posts()
     seen_posts = set(seen_list)
@@ -915,6 +983,14 @@ def rezhim_obychnyy(tolko_novosti=False):
 
     ai_results = []
     obrabotano = []
+
+    do_reliza = datetime.now(timezone.utc) < RELIZ
+    if do_reliza and posts:
+        print("До релиза находок в GTA 6 не бывает — посты помечаю прочитанными без ИИ,")
+        print("весь лимит ИИ отдаю новостям.")
+        obrabotano.extend(p["id"] for p in posts)
+        OTCHET["zametki"].append(f"до релиза: {len(posts)} постов пропущено без ИИ (находок ещё быть не может)")
+        posts = []
 
     for post in posts:
         content = (post["title"] + " " + post["text"]).lower()
