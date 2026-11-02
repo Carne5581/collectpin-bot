@@ -115,6 +115,25 @@ NEWS_ZA_RAZ = 12
 # Порог «громкости» от 1 до 10: тише — в газету не предлагаем.
 NEWS_POROG = 6
 
+# ── АВТООДОБРЕНИЕ НОВОСТЕЙ ──
+# Черновик сразу получает status «да» (и попадает на сайт), если:
+#   • громкость не ниже NEWS_AVTO_POROG,
+#   • в тексте нет чисел, которых не было в заголовке (иначе — «проверь»),
+#   • и либо издание есть в списке NADEZHNYE, либо ту же новость в этом
+#     запуске дали два разных издания и больше.
+# Остальное приходит с пустым status — решаешь сам: «да» или «нет».
+# Не больше NEWS_AVTO_V_DEN автоматически в сутки, чтобы газета не забивалась.
+NEWS_AVTO_POROG = 7
+NEWS_AVTO_V_DEN = 4
+NADEZHNYE = [
+    "rockstar", "take-two", "ign", "gamespot", "kotaku", "eurogamer", "pc gamer", "polygon",
+    "vgc", "video games chronicle", "gamesradar", "the verge", "bloomberg", "reuters",
+    "insider gaming", "push square", "pure xbox", "playstation", "xbox wire", "forbes",
+    "variety", "rolling stone", "the game business", "mashable", "dexerto", "gamerant", "game rant",
+    "stopgame", "игромания", "igromania", "канобу", "kanobu", "dtf", "3dnews", "shazoo",
+    "ixbt", "riot pixels", "goha", "cybersport", "vgtimes", "overclockers", "playground",
+]
+
 # Отчёт для README.md, собирается по ходу запуска
 OTCHET = {"istochniki": [], "ii_ok": 0, "ii_oshibki": 0, "model": "",
           "nahodki": 0, "novosti": 0, "zametki": []}
@@ -796,6 +815,7 @@ def analyze_news(client, post):
 
     kind = str(data.get("kind", "")).lower()
     return {
+        "kind": kind,
         "date": (post.get("published") or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
         "title_ru": str(data.get("title_ru", ""))[:90],
         "text_ru": str(data.get("text_ru", ""))[:260],
@@ -806,6 +826,26 @@ def analyze_news(client, post):
         "hype": hype,
         "note": zametka.strip(),
     }
+
+
+def avto_reshenie(r, k, uzhe):
+    """(True/False, почему) — можно ли показать новость на сайте без проверки."""
+    izd = (k.get("izdanie") or "").strip()
+    nizd = izd.lower()
+    segodnya = "__avto__" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if "⚠️" in r.get("note", ""):
+        return False, "в тексте есть числа не из заголовка"
+    if r["hype"] < NEWS_AVTO_POROG:
+        return False, f"громкость {r['hype']} — ниже {NEWS_AVTO_POROG}"
+    if uzhe.count(segodnya) >= NEWS_AVTO_V_DEN:
+        return False, f"сегодня уже {NEWS_AVTO_V_DEN} новости ушли автоматически"
+    nadezhno = any(n in nizd for n in NADEZHNYE)
+    ohvat = k.get("ohvat", 1)
+    if nadezhno:
+        return True, f"{izd or 'издание'} — в списке надёжных"
+    if ohvat >= 2:
+        return True, f"ту же новость дали {ohvat} издания"
+    return False, f"{izd or 'издание'} нет в списке надёжных, и пишет только оно"
 
 
 def pohozhe(a, b):
@@ -862,6 +902,8 @@ def sobrat_novosti(client, seen_posts, obrabotano):
     # Сначала свежие. Похожие заголовки (одна новость в десяти изданиях)
     # отсекаем ещё до ИИ, чтобы не тратить лимит.
     kandidaty.sort(key=lambda x: x["published"] or datetime.now(timezone.utc), reverse=True)
+    for k in kandidaty:
+        k["ohvat"] = len({(o.get("izdanie") or o["link"]).lower() for o in kandidaty if pohozhe(k["title"], o["title"])})
     otobrany, ostalos = [], []
     for k in kandidaty:
         if any(pohozhe(k["title"], z) for z in uzhe[-400:]) or any(pohozhe(k["title"], o["title"]) for o in otobrany):
@@ -886,7 +928,13 @@ def sobrat_novosti(client, seen_posts, obrabotano):
             if any(pohozhe(r["title_en"], g["title_en"]) for g in gotovo):
                 print("  Повтор уже отобранной.")
                 continue
-            print(f"  📰 Громкость {r['hype']}: {r['title_ru']}")
+            avto, pochemu = avto_reshenie(r, k, uzhe)
+            r["status"] = "да" if avto else ""
+            r["note"] = (("авто: " if avto else "проверь: ") + pochemu + ". " + r["note"]).strip()
+            if avto:
+                uzhe.append("__avto__" + datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                OTCHET["avto"] = OTCHET.get("avto", 0) + 1
+            print(f"  📰 Громкость {r['hype']}: {r['title_ru']} — {'на сайт сразу' if avto else 'ждёт тебя'} ({pochemu})")
             gotovo.append(r)
             uzhe.append(r["title_en"])
         time.sleep(2)
@@ -917,7 +965,8 @@ def zapisat_otchet(rezhim):
         f"- ИИ ответил: **{OTCHET['ii_ok']}** раз, ошибок: **{OTCHET['ii_oshibki']}**"
         + (f", модель `{OTCHET['model']}`" if OTCHET["model"] else ""),
         f"- Находок отправлено в `sbor_ai`: **{OTCHET['nahodki']}**",
-        f"- Новостей отправлено в `gazeta`: **{OTCHET['novosti']}**",
+        f"- Новостей отправлено в `gazeta`: **{OTCHET['novosti']}**"
+        + (f", из них сразу на сайт: **{OTCHET.get('avto', 0)}**" if OTCHET['novosti'] else ""),
     ]
     for z in OTCHET["zametki"]:
         stroki.append(f"- ⚠️ {z}")
