@@ -85,6 +85,17 @@ from groq import Groq
 #    прямо на главной странице репозитория.
 #
 # 5. Новости для газеты (см. выше).
+#
+# ------------------------------------------------------------------
+# ЧТО ИСПРАВЛЕНО 4 НОЯБРЯ (версия 11)
+#
+# 1. Повторы. Раньше бот сравнивал только похожесть заголовков, и одна
+#    новость («предзагрузка 10 ноября») приходила от пяти изданий пятью
+#    строками. Теперь бот читает лист gazeta, показывает ИИ уже принятые
+#    за 10 дней новости и спрашивает «это повтор?». Плюс страховка без ИИ:
+#    общие значимые слова и числа в заголовках.
+# 2. Громкость строже. 9–10 — только официальные объявления Rockstar
+#    и самые громкие утечки. Подборки и пересказы — 3–4.
 # ==================================================================
 
 
@@ -114,6 +125,14 @@ RELIZ = datetime(2026, 11, 19, tzinfo=timezone.utc)
 NEWS_ZA_RAZ = 12
 # Порог «громкости» от 1 до 10: тише — в газету не предлагаем.
 NEWS_POROG = 6
+
+# Опубликованный лист gazeta (тот же CSV, что читают сайт и telegram.py).
+# По нему бот видит, какие новости УЖЕ лежат в таблице, и не шлёт повторы.
+GAZETA_CSV = os.environ.get("GAZETA_CSV") or (
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vTo8nlXDEW0d2p7_w7gHPCHOOUAwn9inlhTsK7jHz6udhtMK9xYXbGq9KPE1rwuO0xrqjmZoIUYH0at"
+    "/pub?gid=1686448780&single=true&output=csv")
+# Сколько дней назад смотреть на уже принятые новости при поиске повторов.
+POVTOR_DNEY = 10
 
 # ── АВТООДОБРЕНИЕ НОВОСТЕЙ ──
 # Черновик сразу получает status «да» (и попадает на сайт), если:
@@ -753,8 +772,9 @@ def chisla(tekst):
     return set(re.findall(r"\d+", tekst or ""))
 
 
-def analyze_news(client, post):
-    """dict — черновик новости, False — неинтересно, None — ошибка ИИ."""
+def analyze_news(client, post, v_gazete=None):
+    """dict — черновик новости, False — неинтересно или повтор, None — ошибка ИИ."""
+    uzhe_spisok = "\n".join("    - " + t for t in (v_gazete or [])[-30:]) or "    (пока пусто)"
     prompt = f"""
     Ты — редактор игровой газеты про GTA 6 (Grand Theft Auto VI) для игроков.
     Сегодня {datetime.now(timezone.utc).strftime('%d.%m.%Y')}. Релиз GTA 6 — 19 ноября 2026.
@@ -764,15 +784,29 @@ def analyze_news(client, post):
     Описание: {post['text'][:600]}
     Издание: {post.get('izdanie', '')}
 
+    УЖЕ ЕСТЬ В ГАЗЕТЕ (последние дни):
+{uzhe_spisok}
+
+    ПОВТОР — если главный факт этого материала уже есть в списке выше, даже
+    другими словами и от другого издания (например, «предзагрузка 10 ноября»
+    и «Rockstar назвала дату предзагрузки» — одна новость). Новая подробность
+    к старой теме (стал известен размер, а раньше была только дата) — не повтор.
+
     НОВОСТЬ — это свежий факт: официальное заявление Rockstar или Take-Two,
     трейлер, дата, цена, предзагрузка, новые детали игры или геймплея,
     крупная утечка, перенос, рекорд, громкое событие вокруг игры.
     НЕ новость: мнения, «10 вещей, которые мы хотим», догадки, теории фанатов,
     гайды, обзоры старых новостей, материалы про другие игры.
 
-    hype — насколько это взорвёт сообщество игроков, от 1 до 10.
-    Официальный трейлер или дата — 9–10. Новые детали геймплея — 7–8.
-    Крупная утечка — 7–8. Мелкая подробность или пересказ — 3–5.
+    hype — насколько это взорвёт сообщество игроков, от 1 до 10. Будь строгим:
+    10 — новый трейлер, перенос релиза, первый показ геймплея от Rockstar.
+    9 — официальное объявление Rockstar/Take-Two о дате, цене, предзагрузке,
+        размере игры, большой порции новых деталей; самая громкая утечка года.
+    7–8 — новые детали геймплея, заметная утечка, рекорд предзаказов.
+    5–6 — мелкая подробность, интервью без новых фактов.
+    3–4 — пересказ уже известного, подборки («что выходит в ноябре»),
+        советы, «когда можно скачать» без новых фактов.
+    Сомневаешься между двумя оценками — ставь меньшую.
 
     kind: "официально" — если это сказала или показала Rockstar/Take-Two,
     "утечка" — слив, "слух" — неподтверждённое, "другое" — всё прочее.
@@ -787,6 +821,7 @@ def analyze_news(client, post):
     Отвечай СТРОГО JSON:
     {{
       "is_news": true или false,
+      "povtor": true или false,
       "hype": число 1–10,
       "kind": "официально / утечка / слух / другое",
       "title_ru": "...", "text_ru": "...",
@@ -797,6 +832,9 @@ def analyze_news(client, post):
     if data is None:
         return None
     if not data.get("is_news"):
+        return False
+    if data.get("povtor") is True:
+        print("  ИИ: повтор новости, которая уже есть в газете.")
         return False
     try:
         hype = int(data.get("hype", 0))
@@ -846,6 +884,63 @@ def avto_reshenie(r, k, uzhe):
     if ohvat >= 2:
         return True, f"ту же новость дали {ohvat} издания"
     return False, f"{izd or 'издание'} нет в списке надёжных, и пишет только оно"
+
+
+SLOVA_STOP = set("the a an of to in on for and is are be will with at by from as it its this that gta grand theft auto vi 6 "
+                 "в на и с по о об для от до к у из за что как это gta гта".split())
+
+MESYACY = {"jan": "m1", "feb": "m2", "mar": "m3", "apr": "m4", "may": "m5", "jun": "m6", "jul": "m7", "aug": "m8",
+           "sep": "m9", "oct": "m10", "nov": "m11", "dec": "m12", "янв": "m1", "фев": "m2", "мар": "m3", "апр": "m4",
+           "мая": "m5", "май": "m5", "июн": "m6", "июл": "m7", "авг": "m8", "сен": "m9", "окт": "m10", "ноя": "m11", "дек": "m12"}
+
+def slova(t):
+    t = (t or "").lower().replace("-", "").replace("\u2011", "")
+    t = re.sub(r"[^a-zа-яё0-9 ]", " ", t)
+    out = set()
+    for w in t.split():
+        if w in SLOVA_STOP or len(w) < 2:
+            continue
+        out.add(MESYACY.get(w[:3], w[:5]) if not w.isdigit() else w)
+    return out
+
+
+def pohozhe_smysl(a, b):
+    """Похожи ли две новости по смыслу: общие значимые слова и числа."""
+    A, B = slova(a), slova(b)
+    if not A or not B:
+        return False
+    obshchie = A & B
+    chisla_a = {w for w in A if w.isdigit()}
+    chisla_b = {w for w in B if w.isdigit()}
+    if chisla_a and chisla_b and not (chisla_a & chisla_b):
+        return False
+    return len(obshchie) >= 3 and len(obshchie) / min(len(A), len(B)) >= 0.45
+
+
+def zagolovki_v_gazete():
+    """Заголовки новостей, которые уже лежат в листе gazeta за последние POVTOR_DNEY дней."""
+    try:
+        r = requests.get(GAZETA_CSV, timeout=40, headers={"User-Agent": "CollectPin scout"})
+        if r.status_code != 200 or r.text.lstrip().startswith("<"):
+            print(f"  Лист gazeta не прочитался (код {r.status_code}) — повторы проверю только по журналу.")
+            return []
+        r.encoding = "utf-8"
+        import csv, io
+        granica = (datetime.now(timezone.utc) - timedelta(days=POVTOR_DNEY)).strftime("%Y-%m-%d")
+        out = []
+        for row in csv.DictReader(io.StringIO(r.text)):
+            row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+            d = row.get("date", "").lstrip("'")
+            if d and d < granica:
+                continue
+            t = row.get("title_en") or row.get("title_ru")
+            if t:
+                out.append(t + (" / " + row["title_ru"] if row.get("title_ru") and row.get("title_en") else ""))
+        print(f"  В листе gazeta за {POVTOR_DNEY} дней: {len(out)} новостей — сверяю с ними.")
+        return out
+    except Exception as e:
+        print(f"  Лист gazeta не прочитался ({e}) — повторы проверю только по журналу.")
+        return []
 
 
 def pohozhe(a, b):
@@ -913,10 +1008,12 @@ def sobrat_novosti(client, seen_posts, obrabotano):
     # Не влезшие в лимит не помечаем — заберём в следующий запуск.
     print(f"Новостей на проверку ИИ: {len(otobrany)} (отложено до следующего раза: {len(ostalos)})")
 
+    v_gazete = zagolovki_v_gazete() if otobrany else []
     gotovo = []
     for k in otobrany:
         print(f"Новость? {k['title'][:80]}")
-        r = analyze_news(client, k)
+        uzhe_est = v_gazete + [g["title_en"] + " / " + g["title_ru"] for g in gotovo]
+        r = analyze_news(client, k, uzhe_est)
         if r is None:
             print("  Откладываем до следующего запуска.")
             continue
@@ -925,8 +1022,11 @@ def sobrat_novosti(client, seen_posts, obrabotano):
         if r is False:
             print("  Тихая или не новость.")
         else:
-            if any(pohozhe(r["title_en"], g["title_en"]) for g in gotovo):
+            if any(pohozhe(r["title_en"], g["title_en"]) or pohozhe_smysl(r["title_en"], g["title_en"]) for g in gotovo):
                 print("  Повтор уже отобранной.")
+                continue
+            if any(pohozhe_smysl(r["title_en"], t.split(" / ")[0]) for t in v_gazete):
+                print("  Повтор новости, которая уже есть в газете.")
                 continue
             avto, pochemu = avto_reshenie(r, k, uzhe)
             r["status"] = "да" if avto else ""
