@@ -116,8 +116,8 @@ GROQ_MODELS = [m.strip() for m in os.environ.get(
     "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant"
 ).split(",") if m.strip()]
 
-# День релиза. До него находок в GTA 6 быть не может.
-RELIZ = datetime(2026, 11, 19, tzinfo=timezone.utc)
+# Начало поиска по первым региональным запускам: 18 ноября в 14:00 МСК.
+SEARCH_START = datetime(2026, 11, 18, 11, tzinfo=timezone.utc)
 
 # Сколько новостей за один запуск показывать ИИ. Бесплатный лимит
 # Groq — около 100 тысяч токенов в сутки на модель; при запуске
@@ -599,15 +599,10 @@ def sprosit_ii(client, prompt):
 
 def pravilo_daty(post):
     """Правило про дату для подсказки модели."""
-    kogda = post.get("published")
-    if kogda and kogda < RELIZ:
-        return (f"Пост опубликован {kogda.strftime('%d.%m.%Y')}, ДО выхода GTA 6 "
-                "(19 ноября 2026). Находок внутри GTA 6 в нём быть не может — "
-                "ставь \"is_candidate\": false.")
-    if not kogda and datetime.now(timezone.utc) < RELIZ:
-        return ("GTA 6 выходит 19 ноября 2026 года и ещё НЕ ВЫШЛА, поэтому "
-                "находок внутри GTA 6 существовать не может — ставь \"is_candidate\": false.")
-    return ("GTA 6 уже вышла (19 ноября 2026), находки в ней возможны. "
+    kogda = post.get("published") or datetime.now(timezone.utc)
+    if kogda < SEARCH_START:
+        return 'До начала поиска находок GTA 6 ставь "is_candidate": false.'
+    return ("С началом регионального запуска находки в GTA 6 возможны. "
             "Но пост должен описывать конкретный предмет или место в игре.")
 
 
@@ -1133,12 +1128,11 @@ def rezhim_obychnyy(tolko_novosti=False):
     ai_results = []
     obrabotano = []
 
-    do_reliza = datetime.now(timezone.utc) < RELIZ
-    if do_reliza and posts:
-        print("До релиза находок в GTA 6 не бывает — посты помечаю прочитанными без ИИ,")
+    if datetime.now(timezone.utc) < SEARCH_START and posts:
+        print("До начала поиска посты помечаю прочитанными без ИИ,")
         print("весь лимит ИИ отдаю новостям.")
         obrabotano.extend(p["id"] for p in posts)
-        OTCHET["zametki"].append(f"до релиза: {len(posts)} постов пропущено без ИИ (находок ещё быть не может)")
+        OTCHET["zametki"].append(f"до начала поиска: {len(posts)} постов пропущено без ИИ")
         posts = []
 
     for post in posts:
