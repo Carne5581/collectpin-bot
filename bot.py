@@ -134,24 +134,8 @@ GAZETA_CSV = os.environ.get("GAZETA_CSV") or (
 # Сколько дней назад смотреть на уже принятые новости при поиске повторов.
 POVTOR_DNEY = 10
 
-# ── АВТООДОБРЕНИЕ НОВОСТЕЙ ──
-# Черновик сразу получает status «да» (и попадает на сайт), если:
-#   • громкость не ниже NEWS_AVTO_POROG,
-#   • в тексте нет чисел, которых не было в заголовке (иначе — «проверь»),
-#   • и либо издание есть в списке NADEZHNYE, либо ту же новость в этом
-#     запуске дали два разных издания и больше.
-# Остальное приходит с пустым status — решаешь сам: «да» или «нет».
-# Не больше NEWS_AVTO_V_DEN автоматически в сутки, чтобы газета не забивалась.
-NEWS_AVTO_POROG = 7
-NEWS_AVTO_V_DEN = 4
-NADEZHNYE = [
-    "rockstar", "take-two", "ign", "gamespot", "kotaku", "eurogamer", "pc gamer", "polygon",
-    "vgc", "video games chronicle", "gamesradar", "the verge", "bloomberg", "reuters",
-    "insider gaming", "push square", "pure xbox", "playstation", "xbox wire", "forbes",
-    "variety", "rolling stone", "the game business", "mashable", "dexerto", "gamerant", "game rant",
-    "stopgame", "игромания", "igromania", "канобу", "kanobu", "dtf", "3dnews", "shazoo",
-    "ixbt", "riot pixels", "goha", "cybersport", "vgtimes", "overclockers", "playground",
-]
+# Новости всегда приходят черновиками. После проверки источника и RU/EN
+# владелец ставит status «да» в листе gazeta.
 
 # Отчёт для README.md, собирается по ходу запуска
 OTCHET = {"istochniki": [], "ii_ok": 0, "ii_oshibki": 0, "model": "",
@@ -812,6 +796,12 @@ def analyze_news(client, post, v_gazete=None):
     - title_ru и title_en — до 60 знаков, живо, без кликбейта и капслока.
     - text_ru и text_en — 1–2 коротких предложения, до 200 знаков.
     - Русский — простой разговорный, на «ты» не обращайся.
+    - RU и EN должны сообщать один и тот же факт с одинаковыми оговорками.
+      Не превращай слух или слова журналиста в подтверждение Rockstar.
+      Не добавляй «впервые», «официально», сроки и характеристики от себя.
+    - Переводи смысл выражений: sick-out — невыход на работу, не отъезд.
+      Сравнение игрового видео с Майами не означает отсутствие связи с городом.
+    - Заканчивай слова и предложения. Если факт неясен, is_news=false.
 
     Отвечай СТРОГО JSON:
     {{
@@ -838,6 +828,13 @@ def analyze_news(client, post, v_gazete=None):
     if hype < NEWS_POROG:
         return False
 
+    limits = {"title_ru": 60, "title_en": 60, "text_ru": 200, "text_en": 200}
+    for field in limits:
+        if not isinstance(data.get(field), str) or not data[field].strip():
+            print(f"  ИИ: пустое или некорректное поле {field}, повторим позже.")
+            return None
+        data[field] = data[field].strip()
+
     # Детектор выдумки: числа в тексте модели должны быть в исходнике
     ishodnik = chisla(post["title"] + " " + post["text"])
     lishnie = (chisla(data.get("text_ru", "")) | chisla(data.get("text_en", "")) |
@@ -845,15 +842,18 @@ def analyze_news(client, post, v_gazete=None):
     zametka = post.get("izdanie", "")
     if lishnie:
         zametka = f"⚠️ числа {', '.join(sorted(lishnie))} не из заголовка — проверь. " + zametka
+    long_fields = [field for field, limit in limits.items() if len(data[field]) > limit]
+    if long_fields:
+        zametka = "⚠️ сократить вручную: " + ", ".join(long_fields) + ". " + zametka
 
     kind = str(data.get("kind", "")).lower()
     return {
         "kind": kind,
         "date": (post.get("published") or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
-        "title_ru": str(data.get("title_ru", ""))[:90],
-        "text_ru": str(data.get("text_ru", ""))[:260],
-        "title_en": str(data.get("title_en", ""))[:90],
-        "text_en": str(data.get("text_en", ""))[:260],
+        "title_ru": data["title_ru"],
+        "text_ru": data["text_ru"],
+        "title_en": data["title_en"],
+        "text_en": data["text_en"],
         "source": post["link"],
         "tag": "слух" if ("утеч" in kind or "слух" in kind) else "",
         "hype": hype,
@@ -862,23 +862,8 @@ def analyze_news(client, post, v_gazete=None):
 
 
 def avto_reshenie(r, k, uzhe):
-    """(True/False, почему) — можно ли показать новость на сайте без проверки."""
-    izd = (k.get("izdanie") or "").strip()
-    nizd = izd.lower()
-    segodnya = "__avto__" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if "⚠️" in r.get("note", ""):
-        return False, "в тексте есть числа не из заголовка"
-    if r["hype"] < NEWS_AVTO_POROG:
-        return False, f"громкость {r['hype']} — ниже {NEWS_AVTO_POROG}"
-    if uzhe.count(segodnya) >= NEWS_AVTO_V_DEN:
-        return False, f"сегодня уже {NEWS_AVTO_V_DEN} новости ушли автоматически"
-    nadezhno = any(n in nizd for n in NADEZHNYE)
-    ohvat = k.get("ohvat", 1)
-    if nadezhno:
-        return True, f"{izd or 'издание'} — в списке надёжных"
-    if ohvat >= 2:
-        return True, f"ту же новость дали {ohvat} издания"
-    return False, f"{izd or 'издание'} нет в списке надёжных, и пишет только оно"
+    """Известность источника не гарантирует точность пересказа и перевода."""
+    return False, "нужна ручная проверка источника и RU/EN перед status=да"
 
 
 SLOVA_STOP = set("the a an of to in on for and is are be will with at by from as it its this that gta grand theft auto vi 6 "
