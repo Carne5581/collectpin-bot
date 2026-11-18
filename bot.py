@@ -8,7 +8,7 @@ import feedparser
 import time
 import difflib
 from datetime import datetime, timezone, timedelta
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from groq import Groq
 
 # ==================================================================
@@ -154,20 +154,18 @@ OTCHET = {"istochniki": [], "ii_ok": 0, "ii_oshibki": 0, "model": "",
 #   4. Скопировать значение вида UC...... (24 знака)
 #   5. Подставить в https://www.youtube.com/feeds/videos.xml?channel_id=ЗДЕСЬ
 #
-# Как узнать адрес ленты сабреддита:
-#   https://www.reddit.com/r/ИМЯ/new.rss?limit=50
-#   Сначала открой reddit.com/r/ИМЯ и убедись, что он существует.
-
-# ВАЖНО: сабреддиты идут ЧЕРЕЗ ОДИН с остальными, а не подряд.
-# Reddit считает обращения по времени, и три запроса подряд он
-# отбивает ответом 429 — ровно это и случилось на первом запуске.
-# Когда между ними стоит YouTube, Reddit успевает остыть сам,
-# без длинного ожидания.
+# Ленты Reddit возвращают 404 на GitHub Actions. RSS авторов гайдов
+# позволяют собирать часть кандидатов без Groq.
 SOURCES = [
     {
-        "name": "Reddit · r/GTA6",
-        "url": "https://www.reddit.com/r/GTA6/new.rss?limit=50",
-        "pro": "сабреддит про GTA 6",
+        "name": "Гайды · PowerPyx",
+        "url": "https://www.powerpyx.com/?s=GTA+6&feed=rss2",
+        "guide_host": "www.powerpyx.com",
+    },
+    {
+        "name": "Гайды · Rare Thief",
+        "url": "https://rarethief.com/feed/",
+        "guide_host": "rarethief.com",
     },
     {
         # GTA Series Videos — самый авторитетный канал по GTA.
@@ -178,11 +176,6 @@ SOURCES = [
         "yt": "@GTASeriesVideos",
     },
     {
-        "name": "Reddit · r/GTAVI",
-        "url": "https://www.reddit.com/r/GTAVI/new.rss?limit=50",
-        "pro": "сабреддит про GTA 6",
-    },
-    {
         # PowerPyx — трофейные гайды, выходят в первые дни.
         # Адрес сверен: UCWBA1-H9A5IldSb3tNwQmtQ
         # В старой версии стояло UCWBA1-H9A5IldSb3JC5Tq1w — 404.
@@ -190,17 +183,6 @@ SOURCES = [
         "pro": "канал с гайдами по разным играм, не только GTA",
         "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UCWBA1-H9A5IldSb3tNwQmtQ",
         "yt": "@PowerPyx",
-    },
-    {
-        # Охотники за секретами GTA 5. После релиза этот народ
-        # первым полезет искать тайники в GTA 6.
-        "name": "Reddit · r/chiliadmystery",
-        "url": "https://www.reddit.com/r/chiliadmystery/new.rss?limit=50",
-        # ВАЖНО: это сабреддит про секреты GTA 5, а не GTA 6.
-        # До релиза он приносит только находки из старой игры —
-        # именно они и попали в таблицу 17 августа. Держим его
-        # ради 19 ноября: эти люди первыми полезут искать в GTA 6.
-        "pro": "сабреддит про секреты GTA 5, НЕ про GTA 6",
     },
     {
         # TGG — гайды по GTA.
@@ -384,7 +366,7 @@ def _fetch_feed(source, popytok=3):
 
     if posledniy_otvet != 200:
         if posledniy_otvet == 404:
-            podskazka = " — такого канала или сабреддита не существует"
+            podskazka = " — адрес ленты не найден"
         elif posledniy_otvet == 429:
             podskazka = (" — сайт просит обращаться реже. Это временно, "
                          "не поломка. Если повторяется каждый день — "
@@ -588,6 +570,35 @@ def pravilo_daty(post):
         return 'До начала поиска находок GTA 6 ставь "is_candidate": false.'
     return ("С началом регионального запуска находки в GTA 6 возможны. "
             "Но пост должен описывать конкретный предмет или место в игре.")
+
+
+def guide_candidate(post):
+    """Отбирает ссылки на гайды для ручной сверки в sbor_ai."""
+    host = post.get("guide_host")
+    published = post.get("published")
+    if not host or not published or published.date() < SEARCH_START.date():
+        return None
+    url = urlparse(post["link"])
+    if url.scheme != "https" or url.netloc.lower() != host:
+        return None
+    title = post["title"]
+    if not re.search(r"\b(?:GTA\s*(?:6|VI)|Grand Theft Auto VI)\b", title, re.I):
+        return None
+    if not re.search(r"\b(?:locations?|where to find)\b", title, re.I):
+        return None
+    if re.search(r"\b(?:rumou?r|leak|trailer)s?\b", title, re.I):
+        return None
+
+    return {
+        "category": "коллекционка",
+        "name": title,
+        "region": "",
+        "coord_x": "",
+        "coord_y": "",
+        "evidence": title,
+        "source_url": post["link"],
+        "image_url": post["image_url"],
+    }
 
 
 def analyze_with_ai(client, post):
@@ -1100,6 +1111,7 @@ def rezhim_obychnyy(tolko_novosti=False):
                 "link": entry.link,
                 "istochnik": source["name"],
                 "pro": source.get("pro", ""),
+                "guide_host": source.get("guide_host"),
             })
             novyh += 1
 
@@ -1116,11 +1128,18 @@ def rezhim_obychnyy(tolko_novosti=False):
     if datetime.now(timezone.utc) < SEARCH_START and posts:
         print("До начала поиска посты помечаю прочитанными без ИИ,")
         print("весь лимит ИИ отдаю новостям.")
-        obrabotano.extend(p["id"] for p in posts)
+        obrabotano.extend(p["id"] for p in posts if not p["guide_host"])
         OTCHET["zametki"].append(f"до начала поиска: {len(posts)} постов пропущено без ИИ")
         posts = []
 
     for post in posts:
+        if post["guide_host"]:
+            candidate = guide_candidate(post)
+            if candidate:
+                ai_results.append(candidate)
+            obrabotano.append(post["id"])
+            continue
+
         content = (post["title"] + " " + post["text"]).lower()
 
         if not any(word in content for word in KEYWORDS):
