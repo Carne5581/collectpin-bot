@@ -860,6 +860,7 @@ def analyze_news(client, post, v_gazete=None):
     kind = str(data.get("kind", "")).lower()
     return {
         "kind": kind,
+        "status": "",
         "date": (post.get("published") or datetime.now(timezone.utc)).strftime("%Y-%m-%d"),
         "title_ru": data["title_ru"],
         "text_ru": data["text_ru"],
@@ -870,12 +871,6 @@ def analyze_news(client, post, v_gazete=None):
         "hype": hype,
         "note": zametka.strip(),
     }
-
-
-def avto_reshenie(r, k, uzhe):
-    """Известность источника не гарантирует точность пересказа и перевода."""
-    return False, "нужна ручная проверка источника и RU/EN перед status=да"
-
 
 SLOVA_STOP = set("the a an of to in on for and is are be will with at by from as it its this that gta grand theft auto vi 6 "
                  "в на и с по о об для от до к у из за что как это gta гта".split())
@@ -1019,13 +1014,7 @@ def sobrat_novosti(client, seen_posts, obrabotano):
             if any(pohozhe_smysl(r["title_en"], t.split(" / ")[0]) for t in v_gazete):
                 print("  Повтор новости, которая уже есть в газете.")
                 continue
-            avto, pochemu = avto_reshenie(r, k, uzhe)
-            r["status"] = "да" if avto else ""
-            r["note"] = (("авто: " if avto else "проверь: ") + pochemu + ". " + r["note"]).strip()
-            if avto:
-                uzhe.append("__avto__" + datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-                OTCHET["avto"] = OTCHET.get("avto", 0) + 1
-            print(f"  📰 Громкость {r['hype']}: {r['title_ru']} — {'на сайт сразу' if avto else 'ждёт тебя'} ({pochemu})")
+            print(f"  📰 Громкость {r['hype']}: {r['title_ru']} — черновик")
             gotovo.append(r)
             uzhe.append(r["title_en"])
         time.sleep(2)

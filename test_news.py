@@ -8,9 +8,8 @@ import unittest
 
 SOURCE = Path(__file__).with_name('bot.py').read_text(encoding='utf-8')
 TREE = ast.parse(SOURCE)
-NAMES = {'chisla', 'analyze_news', 'avto_reshenie'}
-NS = dict(datetime=datetime, timezone=timezone, re=re, NEWS_POROG=6,
-          NEWS_AVTO_POROG=7, NEWS_AVTO_V_DEN=4, NADEZHNYE=['rockstar'])
+NAMES = {'chisla', 'analyze_news'}
+NS = dict(datetime=datetime, timezone=timezone, re=re, NEWS_POROG=6)
 exec(compile(ast.Module(body=[n for n in TREE.body
      if isinstance(n, ast.FunctionDef) and n.name in NAMES], type_ignores=[]),
      'bot.py', 'exec'), NS)
@@ -26,13 +25,10 @@ class NewsTests(unittest.TestCase):
         return NS['analyze_news'](None, dict(title='GTA 6 news', text='',
                                            link='https://example.com', izdanie='Rockstar'))
 
-    def test_trusted_and_widely_reported_news_still_needs_review(self):
-        for outlet in ['Rockstar', 'Unknown']:
-            with self.subTest(outlet=outlet):
-                approved, reason = NS['avto_reshenie'](
-                    dict(hype=10, note=''), dict(izdanie=outlet, ohvat=20), [])
-                self.assertFalse(approved)
-                self.assertTrue(reason)
+    def test_news_remains_a_draft_without_a_generic_review_note(self):
+        result = self.analyze(hype=10)
+        self.assertEqual(result['status'], '')
+        self.assertEqual(result['note'], 'Rockstar')
 
     def test_long_text_is_preserved_and_flagged(self):
         title = 'Разработка игры ' * 10
