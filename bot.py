@@ -113,7 +113,7 @@ NEWS_WEBHOOK_KEY = os.environ.get("NEWS_WEBHOOK_KEY")
 # Модели Groq по порядку. Первая не отвечает — берётся следующая.
 GROQ_MODELS = [m.strip() for m in os.environ.get(
     "GROQ_MODELS",
-    "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant"
+    "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b"
 ).split(",") if m.strip()]
 
 # Начало поиска по первым региональным запускам: 18 ноября в 14:00 МСК.
@@ -134,12 +134,21 @@ GAZETA_CSV = os.environ.get("GAZETA_CSV") or (
 # Сколько дней назад смотреть на уже принятые новости при поиске повторов.
 POVTOR_DNEY = 10
 
-# Новости всегда приходят черновиками. После проверки источника и RU/EN
-# владелец ставит status «да» в листе gazeta.
+NEWS_AVTO_POROG = 7
+NEWS_AVTO_V_DEN = 4
+NADEZHNYE = [
+    "rockstar", "take-two", "ign", "gamespot", "kotaku", "eurogamer", "pc gamer", "polygon",
+    "vgc", "video games chronicle", "gamesradar", "the verge", "bloomberg", "reuters",
+    "insider gaming", "push square", "pure xbox", "playstation", "xbox wire", "forbes",
+    "variety", "rolling stone", "the game business", "mashable", "dexerto", "gamerant", "game rant",
+    "gamingbolt", "gematsu", "game informer", "bbc", "associated press", "the guardian",
+    "powerpyx", "gtabase", "stopgame", "игромания", "igromania", "канобу", "kanobu", "dtf",
+    "3dnews", "shazoo", "ixbt", "riot pixels", "goha", "cybersport", "vgtimes", "overclockers", "playground",
+]
 
 # Отчёт для README.md, собирается по ходу запуска
 OTCHET = {"istochniki": [], "ii_ok": 0, "ii_oshibki": 0, "model": "",
-          "nahodki": 0, "novosti": 0, "zametki": []}
+          "nahodki": 0, "novosti": 0, "avto": 0, "zametki": []}
 
 
 # ── ИСТОЧНИКИ ───────────────────────────────────────────────
@@ -935,11 +944,33 @@ def pohozhe(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio() > 0.6
 
 
+def avto_reshenie(r, k, uzhe):
+    """(True/False, почему) — можно ли показать новость на сайте без ручной проверки."""
+    izd = (k.get("izdanie") or "").strip()
+    nizd = izd.lower()
+    segodnya = "__avto__" + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if "⚠️" in r.get("note", ""):
+        return False, "есть предупреждение по тексту или числам"
+    if r.get("tag") == "слух":
+        return False, "слух или утечка — только после проверки"
+    if r["hype"] < NEWS_AVTO_POROG:
+        return False, f"громкость {r['hype']} — ниже {NEWS_AVTO_POROG}"
+    if uzhe.count(segodnya) >= NEWS_AVTO_V_DEN:
+        return False, f"сегодня уже {NEWS_AVTO_V_DEN} новости ушли автоматически"
+    nadezhno = any(n in nizd for n in NADEZHNYE)
+    ohvat = k.get("ohvat", 1)
+    if nadezhno:
+        return True, f"{izd or 'издание'} — в списке надёжных"
+    if ohvat >= 2:
+        return True, f"ту же новость дали {ohvat} издания"
+    return False, f"{izd or 'издание'} нет в списке надёжных, и пишет только оно"
+
+
 def sobrat_novosti(client, seen_posts, obrabotano):
     """Читает новостные ленты, отбирает громкое. Возвращает черновики."""
     if not NEWS_WEBHOOK_URL:
         print("\nНовости: вебхук не подключён (NEWS_WEBHOOK_URL), пропускаю.")
-        return []
+        return [], None
 
     try:
         with open(NEWS_LOG, "r", encoding="utf-8") as f:
@@ -1014,14 +1045,18 @@ def sobrat_novosti(client, seen_posts, obrabotano):
             if any(pohozhe_smysl(r["title_en"], t.split(" / ")[0]) for t in v_gazete):
                 print("  Повтор новости, которая уже есть в газете.")
                 continue
-            print(f"  📰 Громкость {r['hype']}: {r['title_ru']} — черновик")
+            avto, pochemu = avto_reshenie(r, k, uzhe)
+            r["status"] = "да" if avto else ""
+            if avto:
+                uzhe.append("__avto__" + datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+                print(f"  📰 Громкость {r['hype']}: {r['title_ru']} — на сайт (авто: {pochemu})")
+            else:
+                print(f"  📰 Громкость {r['hype']}: {r['title_ru']} — черновик ({pochemu})")
             gotovo.append(r)
             uzhe.append(r["title_en"])
         time.sleep(2)
 
-    with open(NEWS_LOG, "w", encoding="utf-8") as f:
-        json.dump(uzhe[-1000:], f, ensure_ascii=False)
-    return gotovo
+    return gotovo, uzhe
 
 
 # ── ОТЧЁТ В README.md ───────────────────────────────────────
@@ -1069,6 +1104,33 @@ def rezhim_obychnyy(tolko_novosti=False):
 
     seen_list  = load_seen_posts()
     seen_posts = set(seen_list)
+    obrabotano = []
+
+    # Новости: обрабатываем первыми, чтобы им всегда хватало лимита Groq
+    news_obrabotano = []
+    news_uzhe = None
+    try:
+        novosti, news_uzhe = sobrat_novosti(client, seen_posts, news_obrabotano)
+    except Exception as e:
+        print(f"Новости упали: {e}")
+        OTCHET["zametki"].append(f"сбор новостей упал: {str(e)[:120]}")
+        novosti, news_obrabotano, news_uzhe = [], [], None
+    if novosti:
+        print(f"\nОтправляю новостей в gazeta: {len(novosti)}")
+        if send_news(novosti):
+            OTCHET["novosti"] = len(novosti)
+            OTCHET["avto"] = sum(1 for g in novosti if g.get("status") == "да")
+            obrabotano.extend(news_obrabotano)
+            if news_uzhe is not None:
+                with open(NEWS_LOG, "w", encoding="utf-8") as f:
+                    json.dump(news_uzhe[-1000:], f, ensure_ascii=False)
+        else:
+            OTCHET["zametki"].append("лист gazeta не принял новости — повтор в следующий запуск")
+    else:
+        obrabotano.extend(news_obrabotano)
+        if news_uzhe is not None:
+            with open(NEWS_LOG, "w", encoding="utf-8") as f:
+                json.dump(news_uzhe[-1000:], f, ensure_ascii=False)
 
     print("=" * 64)
     print("ИСТОЧНИКИ")
@@ -1112,7 +1174,6 @@ def rezhim_obychnyy(tolko_novosti=False):
     print(f"Новых постов для проверки: {len(posts)}")
 
     ai_results = []
-    obrabotano = []
 
     if datetime.now(timezone.utc) < SEARCH_START and posts:
         print("До начала поиска посты помечаю прочитанными без ИИ,")
@@ -1164,24 +1225,6 @@ def rezhim_obychnyy(tolko_novosti=False):
         OTCHET["nahodki"] = len(ai_results)
     else:
         print("\nКандидатов нет — отправлять нечего.")
-
-    # Новости: их сбой не мешает находкам, поэтому отдельно
-    news_obrabotano = []
-    try:
-        novosti = sobrat_novosti(client, seen_posts, news_obrabotano)
-    except Exception as e:
-        print(f"Новости упали: {e}")
-        OTCHET["zametki"].append(f"сбор новостей упал: {str(e)[:120]}")
-        novosti, news_obrabotano = [], []
-    if novosti:
-        print(f"\nОтправляю новостей в gazeta: {len(novosti)}")
-        if send_news(novosti):
-            OTCHET["novosti"] = len(novosti)
-            obrabotano.extend(news_obrabotano)
-        else:
-            OTCHET["zametki"].append("лист gazeta не принял новости — повтор в следующий запуск")
-    else:
-        obrabotano.extend(news_obrabotano)
 
     seen_list.extend(obrabotano)
     save_seen_posts(seen_list)
