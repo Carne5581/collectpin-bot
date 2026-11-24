@@ -8,8 +8,9 @@ import unittest
 
 SOURCE = Path(__file__).with_name('bot.py').read_text(encoding='utf-8')
 TREE = ast.parse(SOURCE)
-NAMES = {'chisla', 'analyze_news'}
-NS = dict(datetime=datetime, timezone=timezone, re=re, NEWS_POROG=6)
+NAMES = {'chisla', 'analyze_news', 'avto_reshenie'}
+NS = dict(datetime=datetime, timezone=timezone, re=re, NEWS_POROG=6,
+          NEWS_AVTO_POROG=7, NEWS_AVTO_V_DEN=4, NADEZHNYE=['ign', 'rockstar'])
 exec(compile(ast.Module(body=[n for n in TREE.body
      if isinstance(n, ast.FunctionDef) and n.name in NAMES], type_ignores=[]),
      'bot.py', 'exec'), NS)
@@ -51,6 +52,19 @@ class NewsTests(unittest.TestCase):
         self.assertIs(self.analyze(hype=3), False)
         self.assertIs(self.analyze(povtor=True), False)
         self.assertIs(self.analyze(is_news=False), False)
+
+    def test_auto_publish_rules(self):
+        avto = NS['avto_reshenie']
+        base_r = dict(hype=8, tag='официально', note='')
+        base_k = dict(izdanie='IGN', ohvat=1)
+        self.assertIs(avto(base_r, base_k, [])[0], True)
+        self.assertIs(avto(dict(base_r, tag='слух'), base_k, [])[0], False)
+        self.assertIs(avto(dict(base_r, note='⚠️ числа'), base_k, [])[0], False)
+        self.assertIs(avto(dict(base_r, hype=6), base_k, [])[0], False)
+        today = '__avto__' + datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        self.assertIs(avto(base_r, base_k, [today] * 4)[0], False)
+        self.assertIs(avto(base_r, dict(izdanie='Unknown', ohvat=2), [])[0], True)
+        self.assertIs(avto(base_r, dict(izdanie='Unknown', ohvat=1), [])[0], False)
 
 
 if __name__ == '__main__':
